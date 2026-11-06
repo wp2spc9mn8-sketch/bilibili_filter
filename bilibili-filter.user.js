@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         九天 · B站推荐流审核（RV-240416）
+// @name         Bilibili 低质营销号过滤
 // @namespace    local.kent.blf
 // @charset      UTF-8
-// @version      4.46.0
-// @description  九天的审核评估：把 B 站首页推荐流按授权等级审一遍 —— 主题红线 / 硬时长阈值 / 文案指纹 + UP 主否决，只留够格的
+// @version      4.47.0
+// @description  过滤 B 站首页推荐流：主题屏蔽 + 硬时长下限 + 文案指纹 + UP 主黑名单
 // @author       kent
 // @match        https://www.bilibili.com/*
 // @updateURL    http://127.0.0.1:8899/bilibili-filter.user.js
@@ -19,31 +19,17 @@
   /* ======================= 配置区（改这里就行） ======================= */
 
   /*
-   * ── 这层文创外壳是什么 ────────────────────────────────────────────
+   * ── 改代码时请守住两条 ────────────────────────────────────────
    *
-   * 「九天」＝ RV-240416，小说《龙腾纪元·坤灵战记》里外遣双核的**审核核**。
-   * 它的本职是守 II 型接触宪法：观测、阈值、不仲裁内战、最小干预。
-   * 这个脚本干的活跟它是同一件事 —— 对一条信息流做完评估再决定动不动手。
-   *
-   * 所以对外文案用了它的口径（审核 / 否决 / 豁免 / 观测窗），但**判定逻辑
-   * 一个字没改**：下面的 TOPICS、指纹打分、时长门、白名单优先级，仍是
-   * 4.33.0 那套实测出来的规则。设定是外壳，不是判据。
-   *
-   * 改代码时请守住两条：
-   *   1. 不要为了「像设定」去改判定行为 —— 误杀比不文艺贵得多。
-   *   2. CONFIG 的键名、localStorage 的键（blf:blacklist / blf:whitelist）
+   *   1. CONFIG 的键名、localStorage 的键（blf:blacklist / blf:whitelist）
    *      是对外契约：测试按字面匹配，用户的旧数据也挂在这上面。
    *
-   * ── 档位与干预授权等级（IAL）的对应 ──────────────────────────────
-   *   off        → IAL-0 纯观测    只看不动
-   *   light      → IAL-1 被动援助  只杀标题明确的
-   *   balanced   → IAL-2 隐蔽保护  标题 + 时长组合
-   *   aggressive → IAL-4 主动防御  最严；IAL-4 是「从帮到打」的分水岭
-   * 档位字符串本身不要改：测试文件按 mode 字段的字面值做字符串替换，
-   * 注释里也不要复写那一整个取值 —— 否则替换会命中注释，配置行反而没改。
+   *   2. 档位字符串不要改：测试文件按 mode 字段的字面值做字符串替换，
+   *      注释里也不要复写那一整个取值 —— 否则替换会命中注释，
+   *      配置行反而没改。
    */
   const CONFIG = {
-    // 档位：off 关闭(IAL-0) | light 只杀标题明确的(IAL-1) | balanced 标题+时长(IAL-2) | aggressive 最严(IAL-4)
+    // 档位：off 关闭 | light 只杀标题明确的 | balanced 标题+时长组合 | aggressive 最严
     mode: 'aggressive',
     aggressiveMax: 120,  // 短于此秒数：走更低的指纹门槛
     shortFpThreshold: 2, // 短视频门槛：大字报的标题多半带口语/标题党特征
@@ -122,11 +108,7 @@
   };
   /* =================================================================== */
 
-  const VERSION = '4.46.0';
-
-  // 呼号 / 代号。正文层用呼号，文档与报告标记用中码 —— 这是原作的编号三层制。
-  const CALLSIGN = '九天';
-  const TERMINAL_ID = 'RV-240416';
+  const VERSION = '4.47.0';
 
   let stats = { apiHidden: 0, apiSeen: 0, domHidden: 0, domSeen: 0, linkCount: 0 };
 
@@ -363,10 +345,6 @@
     }
   }
 
-  // 档位 → 干预授权等级。纯展示用，不参与任何判定。
-  const IAL_LABEL = { off: 'IAL-0', light: 'IAL-1', balanced: 'IAL-2', aggressive: 'IAL-4' };
-  function ialOf(mode) { return IAL_LABEL[mode] || mode; }
-
   /* ---------------------------- 计数徽章 ------------------------------ */
   let badgeEl = null;
   function updateBadge() {
@@ -384,8 +362,8 @@
         'border:1px solid rgba(255,255,255,.18)',
         'opacity:.55', 'transition:opacity .2s',
       ].join(';');
-      badgeEl.title = CALLSIGN + ' ' + TERMINAL_ID + ' · 审核核（守 II 型接触宪法）\n'
-        + '点击查看 / 收起审核日志 · v' + VERSION;
+      badgeEl.title = 'B 站低质内容过滤 v' + VERSION + '\n'
+        + '点击查看 / 收起拦截明细';
       badgeEl.addEventListener('mouseenter', () => { badgeEl.style.opacity = '1'; });
       badgeEl.addEventListener('mouseleave', () => { badgeEl.style.opacity = '.55'; });
       badgeEl.addEventListener('click', () => showPanel());
@@ -394,12 +372,11 @@
     const hid = stats.apiHidden + stats.domHidden;
     const seen = stats.apiSeen + stats.domSeen;
     if (degradedActive()) {
-      badgeEl.textContent = '🛡 ' + CALLSIGN + ' · 判定异常，退回观测 60s';
+      badgeEl.textContent = '🛡 v' + VERSION + ' 降级（判定异常，60 秒后重试）';
       badgeEl.style.background = 'rgba(150,40,40,.85)';
       return;
     }
-    badgeEl.textContent = '🛡 ' + CALLSIGN + ' · ' + ialOf(CONFIG.mode)
-      + ' 拦 ' + hid + ' / 扫 ' + seen;
+    badgeEl.textContent = '🛡 v' + VERSION + ' ' + CONFIG.mode + ' 拦 ' + hid + ' / 扫 ' + seen;
   }
 
   /* --------------------------- 拦截记录面板 --------------------------- */
@@ -441,14 +418,14 @@
     head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px';
     const bl = Object.keys(store.all()).length;
     const wl = Object.keys(allow.all()).length;
-    head.innerHTML = '<b>' + CALLSIGN + ' · 审核日志 ' + recentHidden.length + ' 条</b>' +
-      '<span style="opacity:.6;font-size:11px">' + TERMINAL_ID + ' · 否决 ' + bl + ' · 豁免 ' + wl + '</span>';
+    head.innerHTML = '<b>最近拦截 ' + recentHidden.length + ' 条</b>' +
+      '<span style="opacity:.6;font-size:11px">黑名单 ' + bl + ' · 白名单 ' + wl + '</span>';
     el.appendChild(head);
 
     if (!recentHidden.length) {
       const empty = document.createElement('div');
       empty.style.cssText = 'opacity:.6;padding:12px 0';
-      empty.textContent = '这一屏，九天没找到该拦的。';
+      empty.textContent = '这一屏没有拦截记录。';
       el.appendChild(empty);
     }
 
@@ -482,7 +459,7 @@
       if (r.mid) {
         const okBtn = document.createElement('button');
         okBtn.textContent = '✅ 放行';
-        okBtn.title = '列入授权例外：该 UP 主此后永久豁免审核';
+        okBtn.title = '把这个 UP 主加入白名单，以后永不屏蔽';
         okBtn.style.cssText = [
           'margin-left:auto', 'border:1px solid rgba(255,255,255,.25)',
           'background:rgba(80,160,90,.3)', 'color:#d8ffd8', 'cursor:pointer',
@@ -3084,7 +3061,7 @@
     const btn = document.createElement('button');
     btn.className = 'blf-block-btn';
     btn.textContent = '⛔';
-    btn.title = '否决该 UP 主：' + (info.author || info.mid) + ' 此后其全部内容不再进入审核';
+    btn.title = '屏蔽 UP 主：' + (info.author || info.mid);
     btn.style.cssText = [
       'position:absolute', 'top:6px', 'right:6px', 'z-index:99',
       'width:22px', 'height:22px', 'line-height:20px', 'padding:0',
@@ -3238,7 +3215,7 @@
         console.warn(TAG, '本屏已全部过滤，放回 1 条软判定内容避免空白');
       }
       if (badgeEl) {
-        badgeEl.textContent = '🛡 ' + CALLSIGN + ' · 本屏全数否决（' + hard.length + ' 条红线/否决）';
+        badgeEl.textContent = '🛡 v' + VERSION + ' 本屏已全部过滤（' + hard.length + ' 条主题/黑名单）';
         badgeEl.style.background = 'rgba(40,90,60,.85)';
       }
       return false;
@@ -3254,7 +3231,7 @@
       console.warn(TAG, '疑似判定异常（' + soft.length + ' 条全部软判定），已恢复并在 '
         + (DEGRADE_COOLDOWN_MS / 1000) + ' 秒内降级');
       if (badgeEl) {
-        badgeEl.textContent = '🛡 ' + CALLSIGN + ' · 已撤回（判定异常，60s 后重试）';
+        badgeEl.textContent = '🛡 v' + VERSION + ' 已自动恢复（判定异常，60 秒后重试）';
         badgeEl.style.background = 'rgba(150,40,40,.85)';
       }
       return true;
