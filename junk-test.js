@@ -24,7 +24,9 @@ const cases=[
  [25,'赶紧看！马上就要删了',true,'速删体'],
  [48,'别再被骗了，真相只有一个',true,'别再+真相'],
  // 以下为不该被砍的正常内容
- [50,'第一视角：开箱这台老相机',false,'正常第一视角'],
+ // 4.24.0：不足 minKeepDuration（180s）一律砍。这条 50s 的正常内容也在此列，
+ // 用 'short' 标记：它预期被砍，但不计入质量误杀，也不算营销号召回。
+ [50,'第一视角：开箱这台老相机','short','正常第一视角（按长度删）'],
  [1800,'纯音乐｜雨声助眠 30 分钟',false,'正常长音频'],
  [600,'【4K】挪威自驾 Day3｜松恩峡湾',false,'正常Vlog'],
  [240,'用 Rust 重写了一遍解析器，性能提升 3 倍',false,'正常技术视频'],
@@ -32,11 +34,16 @@ const cases=[
 let fail=0,recall=0,recallTotal=0,fp=0;
 for(const [dur,title,expect,tag] of cases){
   const r=BLF.test([{duration:dur,title,owner:{mid:1,name:'t'},stat:{view:5e4,like:3e3},goto:'av'}])[0];
-  const ok=r.hide===expect;
-  if(expect){recallTotal++;if(r.hide)recall++;}
-  if(!expect&&r.hide)fp++;
+  const ok = expect==='short' ? r.hide===true : r.hide===expect;
+  if(expect===true){recallTotal++;if(r.hide)recall++;}
+  if(expect===false&&r.hide)fp++;
   if(!ok)fail++;
   console.log((ok?' PASS ':' FAIL ')+(r.hide?'砍':'留'),String(r.signals).padStart(4),dur+'s',title.slice(0,28).padEnd(30),tag);
 }
 console.log(`\n召回: ${recall}/${recallTotal} 营销号被砍   误杀: ${fp} 条正常内容   断言失败: ${fail}`);
+// 时长下限本身用一对边界断言确认，不依赖上面任何一条样本
+const atKeeper = BLF.test([{duration:180,title:'刚好三分钟的正常视频',owner:{mid:2,name:'x'},stat:{view:5e4,like:3e3},goto:'av'}])[0];
+const below = BLF.test([{duration:179,title:'差一秒三分钟的正常视频',owner:{mid:3,name:'y'},stat:{view:5e4,like:3e3},goto:'av'}])[0];
+console.log(`\n时长下限: 179s ${below.hide?'砍':'留'} / 180s ${atKeeper.hide?'砍':'留'}`);
+if (atKeeper.hide || !below.hide) { fail++; console.log(' FAIL 时长下限边界不对'); }
 process.exit(fail?1:0);

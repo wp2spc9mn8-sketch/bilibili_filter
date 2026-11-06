@@ -75,9 +75,11 @@ console.log('\n--- 规则断言 ---');
 check('20s + 强营销标题 → 隐藏', s[0].hide === true);
 check('60s + 收藏党话术 → 隐藏', s[1].hide === true);
 check('30 分钟纪录片 → 保留',    s[2].hide === false);
-check('25s 但标题正常 → 保留',   s[3].hide === false);
-check('45s 央视军事短新闻 → 保留（不误伤）', s[4].hide === false);
-check('62s 生活记录 → 保留（不误伤）',      s[5].hide === false);
+// 4.24.0 起改为硬时长下限：不足 minKeepDuration 一律隐藏。
+// 旧断言（25s/45s/62s 应保留）已反转 —— 这是用户的长度偏好，不是误伤。
+check('25s 正常标题 → 按长度隐藏', s[3].hide === true);
+check('45s 央视军事 → 按长度隐藏（时长优先于权威豁免）', s[4].hide === true);
+check('62s 生活记录 → 按长度隐藏', s[5].hide === true);
 
 // 关注白名单 & 黑名单优先级
 const followed = BLF.test([{ duration: 15, title: '震惊！！！', owner: { mid: 9, name: 'f' }, is_followed: true, goto: 'av' }]);
@@ -112,7 +114,7 @@ check('20 条全垃圾 → 仍保留 ' + BLF.config.keepAtLeast + ' 条（首页
 const realShip = items.find((x) => String(x.title).includes('四川舰'));
 if (realShip) {
   const r = BLF.test([realShip])[0];
-  check('真实数据: 央视军事 45s 短新闻 → 保留（不误伤）', r.hide === false);
+  check('真实数据: 央视军事 45s → 按长度隐藏', r.hide === true);
 }
 const realCode = items.find((x) => String(x.title).includes('兑换码'));
 if (realCode) {

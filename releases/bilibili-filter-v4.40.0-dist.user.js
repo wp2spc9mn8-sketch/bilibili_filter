@@ -1,0 +1,3156 @@
+// ==UserScript==
+// @name         九天 · B站推荐流审核（RV-240416）
+// @namespace    local.kent.blf
+// @charset      UTF-8
+// @version      4.40.0
+// @description  九天的审核评估：把 B 站首页推荐流按授权等级审一遍 —— 主题红线 / 硬时长阈值 / 文案指纹 + UP 主否决，只留够格的
+// @author       kent
+// @match        https://www.bilibili.com/*
+// @run-at       document-start
+// @grant        none
+// @noframes
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ======================= 配置区（改这里就行） ======================= */
+
+  /*
+   * ── 这层文创外壳是什么 ────────────────────────────────────────────
+   *
+   * 「九天」＝ RV-240416，小说《龙腾纪元·坤灵战记》里外遣双核的**审核核**。
+   * 它的本职是守 II 型接触宪法：观测、阈值、不仲裁内战、最小干预。
+   * 这个脚本干的活跟它是同一件事 —— 对一条信息流做完评估再决定动不动手。
+   *
+   * 所以对外文案用了它的口径（审核 / 否决 / 豁免 / 观测窗），但**判定逻辑
+   * 一个字没改**：下面的 TOPICS、指纹打分、时长门、白名单优先级，仍是
+   * 4.33.0 那套实测出来的规则。设定是外壳，不是判据。
+   *
+   * 改代码时请守住两条：
+   *   1. 不要为了「像设定」去改判定行为 —— 误杀比不文艺贵得多。
+   *   2. CONFIG 的键名、localStorage 的键（blf:blacklist / blf:whitelist）
+   *      是对外契约：测试按字面匹配，用户的旧数据也挂在这上面。
+   *
+   * ── 档位与干预授权等级（IAL）的对应 ──────────────────────────────
+   *   off        → IAL-0 纯观测    只看不动
+   *   light      → IAL-1 被动援助  只杀标题明确的
+   *   balanced   → IAL-2 隐蔽保护  标题 + 时长组合
+   *   aggressive → IAL-4 主动防御  最严；IAL-4 是「从帮到打」的分水岭
+   * 档位字符串本身不要改：测试文件按 mode 字段的字面值做字符串替换，
+   * 注释里也不要复写那一整个取值 —— 否则替换会命中注释，配置行反而没改。
+   */
+  const CONFIG = {
+    // 档位：off 关闭(IAL-0) | light 只杀标题明确的(IAL-1) | balanced 标题+时长(IAL-2) | aggressive 最严(IAL-4)
+    mode: 'aggressive',
+    aggressiveMax: 120,  // 短于此秒数：走更低的指纹门槛
+    shortFpThreshold: 2, // 短视频门槛：大字报的标题多半带口语/标题党特征
+    fpThreshold: 3,      // 2-10 分钟区间：文案指纹达到几分就砍
+    fpLongThreshold: 4,  // 10 分钟以上：要求略严
+    // 硬时长下限：短于此秒数一律不看，与话题/质量无关。
+    // 0 = 关闭。这是用户的长度偏好，不是对内容的判断：
+    // 它排在主题判定之后、权威媒体豁免之前 —— 央视 45s 短新闻也会被删。
+    minKeepDuration: 180,
+    // 注：4.24.0 删掉了 shortDuration / minDuration / softDuration / longDuration。
+    // 它们是 4.0 之前的遗留配置，没有任何代码引用；而 longDuration 的注释
+    //（「长视频豁免区 ≥180 保留」）与实际行为相反，留着只会误导。
+    keepAtLeast: 2,      // 每批推荐保底保留条数，防止把首页刷空
+
+    // ---- 主题屏蔽（与"内容质量"无关，纯话题偏好）----
+    // 命中即拦，不看时长和文案分数。规则表见 TOPICS。
+    topics: {
+      ai: true,            // AI 内容：标题里标注 AI / AIGC / 人工智能
+      aiDrama: true,       // AI剧情短剧：让 Claude / DeepSeek 谈恋爱、傲娇大小姐
+      aiAccount: true,     // AI模型账号：UP 名里标注了模型名，整号不看
+      meme: true,          // 猫meme：标题标注猫meme，或 UP 名就是猫meme剧场
+      repost: true,        // 外网搬运：推特热帖 / Reddit 高赞 / 外网热议
+      tutor: true,         // 升学导师：张雪峰这类导师观点输出
+      gender: true,        // 两性对立 / 性别引战
+      relationship: true,  // 情感关系 / 婚恋八卦
+      exam: true,          // 考公考研培训
+      accident: true,      // 车祸事故
+      comedy: true,        // 搞笑段子
+      // ---- 粗俗 / 低质娱乐 ----
+      vulgar: true,        // 低俗粗鄙：猎奇死亡、恶心物、擦边、粗口
+      deathBait: true,     // 死亡猎奇：上吊身亡 / 跳楼自杀 / 遗体被发现
+      foreignAwe: true,    // 外国人爽文：老外被中国震撼、后背发凉
+      gossip: true,        // 娱乐八卦：绯闻、塌房、红毯比美
+      hustle: true,        // 搞钱割韭菜：副业、月入过万、卖课
+      superstition: true,  // 玄学迷信：算命、风水、转运
+      gambling: true,      // 赌博博彩：赌球、彩票、盘口
+      binge: true,         // 吃播暴食：大胃王、生吃、暴食
+      flame: true,         // 引战撕逼：地域黑、骂战、拉踩
+      lowbrow: true,       // 土味低智：社会摇、装疯卖傻、扮丑
+      gaming: true,        // 游戏内容：攻略、卡组、实况、版本解读
+      ultraman: true,      // 奥特曼：特摄剧、玩具卡片、角色解说
+      mindset: true,       // 成功学 / 认知觉醒：阶层揭秘、普通人不知道
+      // ---- 以下是 4.7.0 补的类别：它们既不是知识，也不是营销号 ----
+      pseudoscience: true, // 伪科普 / 养生谣言：排毒、秘方、量子能量水
+      selfhelp: true,      // 自律鸡汤：学霸方法、逆袭、改变人生
+      lifestyle: true,     // 生活方式：穿搭、减肥、医美、装修、独居
+      parenting: true,     // 育儿鸡汤：聪明妈妈、鸡娃、兴趣班
+      career: true,        // 职场叙事：裸辞、被裁、大厂真实一天
+      quiz: true,          // 心理测试：MBTI、测测你、自测量表
+      warPorn: true,       // 军事爽文：美军这次栽了、战争背后的真相
+      whyBait: true,       // 设问式营销体：为什么现在的年轻人都不…
+      socialTake: true,    // 现象议论体：年轻人集体养大肥鱼，一场…的自救
+      qing: true,          // 清史内容：清朝 / 晚清 / 康熙乾隆 / 清末人物
+      rankBait: true,      // 锐评排名：从夯到拉锐评十大美男 / 第N名实至名归
+      tycoon: true,        // 商业大佬叙事：马云 / 刘强东 / 王健林 / 娃哈哈 / 恒大
+      foreignPol: true,    // 外国政要：奥巴马 / 特朗普 / 拜登 / 普京 等
+      cosplay: true,       // COS 角色扮演：漫展 cos、coser、叮当猫COS事件
+      streamer: true,      // 主播 / 直播：游戏主播、带货主播、主播八卦
+      family: true,        // 原生家庭：控诉父母、断亲、东亚父母叙事
+      manipulation: true,  // 厚黑权术：厚黑学、为人处世、拿你立威怎么办
+    },
+
+    // 隐藏首页的直播卡片。
+    //
+    // 注意：接口层的 goto==='live' 判断靠不住 —— 这个项目的 hook 从未触发过，
+    // 所有过滤都发生在 DOM 层。而 scan() 原来只抓 /video/BV 与 /video/av，
+    // 直播卡指向 live.bilibili.com，**根本不在扫描范围内**：
+    // 开关开着也删不掉。4.33.0 起把直播链接也纳入扫描，这个开关才真的生效。
+    hideLive: true,
+    hideAds: true,       // true = 隐藏广告卡片（接口 goto/cm + DOM 广告角标）
+    showBadge: true,     // 右下角显示过滤计数徽章
+    debug: false,        // true = 控制台打印每条判定
+  };
+  /* =================================================================== */
+
+  const VERSION = '4.40.0';
+
+  // 呼号 / 代号。正文层用呼号，文档与报告标记用中码 —— 这是原作的编号三层制。
+  const CALLSIGN = '九天';
+  const TERMINAL_ID = 'RV-240416';
+
+  let stats = { apiHidden: 0, apiSeen: 0, domHidden: 0, domSeen: 0, linkCount: 0 };
+
+  // 降级状态：带冷却，不是永久的。见 recoverIfEmpty 的说明。
+  // 放在顶部是因为 updateBadge（很早就定义）也要读它。
+  let degraded = false;
+  let degradedUntil = 0;
+  const DEGRADE_COOLDOWN_MS = 60000;
+
+  function degradedActive() {
+    if (!degraded) return false;
+    if (Date.now() < degradedUntil) return true;
+    degraded = false;   // 冷却结束，自动恢复过滤
+    return false;
+  }
+
+  const LS_KEY = 'blf:blacklist';
+  const LS_WHITE = 'blf:whitelist';
+  const TAG = '[BLF]';
+
+  /* ---------------------------- 黑名单存储 ---------------------------- */
+  const store = {
+    all() {
+      try { return JSON.parse(localStorage.getItem(LS_KEY) || '{}'); }
+      catch { return {}; }
+    },
+    has(mid) { return mid != null && String(mid) in this.all(); },
+    add(mid, name) {
+      if (mid == null) return;
+      const b = this.all();
+      b[String(mid)] = name || String(mid);
+      localStorage.setItem(LS_KEY, JSON.stringify(b));
+      // 互斥必须双向：allow.add 会清 store，这里也必须清 allow。
+      // 否则同一个 mid 两边都在，而接口层与页面层的优先级相反 →
+      // API 放行、DOM 隐藏，表现为「点了 ⛔ 好像没生效，刷新又回来」。
+      allow.remove(mid);
+      log('已加入黑名单:', mid, name);
+    },
+    remove(mid) {
+      const b = this.all();
+      delete b[String(mid)];
+      localStorage.setItem(LS_KEY, JSON.stringify(b));
+    },
+  };
+
+  // 白名单：被误杀的 UP 主点 ✅ 后永不屏蔽。
+  // 这是误杀的唯一可靠兜底 —— 规则再聪明也会错判个别内容。
+  const allow = {
+    all() {
+      try { return JSON.parse(localStorage.getItem(LS_WHITE) || '{}'); }
+      catch { return {}; }
+    },
+    has(mid) { return mid != null && String(mid) in this.all(); },
+    add(mid, name) {
+      if (mid == null) return;
+      const w = this.all();
+      w[String(mid)] = name || String(mid);
+      localStorage.setItem(LS_WHITE, JSON.stringify(w));
+      // 白名单和黑名单互斥，避免状态矛盾
+      store.remove(mid);
+      log('已加入白名单:', mid, name);
+    },
+    remove(mid) {
+      const w = this.all();
+      delete w[String(mid)];
+      localStorage.setItem(LS_WHITE, JSON.stringify(w));
+    },
+  };
+
+  function log(...a) { if (CONFIG.debug) console.log(TAG, ...a); }
+
+  /* ---------------------- 已关注 UP 的会话级缓存 -----------------------
+     is_followed 只有接口层拿得到；DOM 层的 cardInfo() 里没有这个字段。
+     不补的话，已关注 UP 发的主题内容会：接口层放行 → 卡片渲染 →
+     judgeCard 命中主题 → 被隐藏。用户最高优先级的偏好反而被误杀。
+     这里把接口层见到的已关注 mid 存下来，给 DOM 层查。         */
+  const followedMids = new Set();
+
+  function isFollowed(mid) {
+    return mid != null && followedMids.has(String(mid));
+  }
+
+  /* -------------------------- 低质 UP 主累计 --------------------------- */
+  // 营销号是批量生产的：同一个号连续出「强营销」内容，就把它整个拉黑。
+  // 只接受强信号（营销词 / 价格锚点）计数，不拿结构类分数连坐，
+  // 否则一条围棋题、一篇技术讲解就能把正经 UP 主送走。
+  // 权威媒体的短新闻不该被"短的一律砍"误伤。
+  // 精确匹配，避免 "央视视角" 这类蹭名字的号蒙混过关。
+  const OFFICIAL = /^(新华社|新华网|央视新闻|央视军事|央视网|央视财经|央视一套|人民日报|人民日报海外版|中国军号|共青团中央|观察者网|解放军报|中国日报|环球时报|中央广播电视总台|CCTV|CGTN)$/;
+
+  /* ---------------------------- 广告识别 ----------------------------
+     判据只用**结构标记**，不看标题文字。
+
+     为什么不匹配标题里的「广告」二字：「中国广告业四十年」「广告的
+     商业模式」是正常内容，按词匹配会成片误杀。广告位的可靠信号在
+     接口字段和 DOM 属性上，不在文案里。                                */
+
+  // 接口层：goto / card_goto / card_type 表示非内容流。
+  // 用整值匹配而不是子串 —— "ad" 出现在 "badge"、"loading" 里都是误判。
+  const AD_GOTO = /^(?:ad|cm|ad_av|ad_web|ad_live|ad_banner|commercial|promo)$/i;
+  const AD_CARD_TYPE = /^(?:cm|ad|ad_\w*|promo|commercial)$/i;
+
+  function isAdItem(it) {
+    if (!it || typeof it !== 'object') return false;
+    for (const k of ['goto', 'card_goto', 'card_type', 'cardType']) {
+      const v = it[k];
+      if (typeof v === 'string' && (AD_GOTO.test(v) || AD_CARD_TYPE.test(v))) return true;
+    }
+    return false;
+  }
+
+  // DOM 层：广告卡片上的结构标记。
+  // 刻意避开裸 [class*="ad"] —— 它会咬到 download / loading / badge / header，
+  // 那些 class 在正常卡片里到处都是。只认这几种明确的写法：
+  //   data-ad-id 属性、is-ad 状态类、--ad 修饰类、ad-tag / ad-badge 角标
+  const AD_MARK_SEL = '[data-ad-id], [data-ad], .is-ad, [class*="--ad"], .ad-tag, .ad-badge, .bili-ad';
+  // 卡片上的「广告」角标文字。只在这个角标元素里取文字，
+  // 不在整张卡片里找 —— 否则标题含「广告」的正常视频会被误杀。
+  const AD_LABEL_SEL = '.bili-video-card__info--ad, [class*="ad-tag"], [class*="ad-badge"], [class*="ad--text"]';
+  const AD_LABEL_TEXT = /^(?:广告|赞助|推广|AD|Ad|ad|广告位)$/;
+
+  /* ---- 首页 banner / 活动推广位 ----
+     这些不是视频卡片，CARD_SEL 抓不到，要单独清。
+
+     只用**强广告属性**定位（data-ad-id / ad-report / 明确的 *-ad-* 修饰类），
+     不按文字猜 —— banner 上的文案经常是「限时」「首发」这类正常词。
+     再加一道容器保护：含链接数超过 MAX_LINKS_PER_CARD 的区域跳过，
+     避免把整片信息流当成一个 banner 隐藏掉。                        */
+  const AD_BANNER_SEL = [
+    '[data-ad-id]',
+    '[data-ad-req-id]',
+    '[class*="ad-banner"]',
+    '[class*="banner-ad"]',
+    '.bili-feed-banner__ad',
+    '.ad-report',
+  ].join(', ');
+
+  // 候选节点必须真的带广告标记才算。选择器匹配本身不够可靠：
+  // 某些 polyfill / 测试桩对不认识的复杂选择器会把整批节点返回，
+  // 不复核就会把整片信息流当 banner 清掉。这是实际测出来的坑。
+  function bannerIsAd(el) {
+    if (!el) return false;
+    const attr = (k) => (el.getAttribute ? el.getAttribute(k) : null);
+    if (attr('data-ad-id') || attr('data-ad-req-id')) return true;
+    const cls = String((el.className && (el.className.baseVal ?? el.className)) || '');
+    return /(?:^|\s)(?:ad-report|bili-feed-banner__ad)(?:\s|$)/.test(cls)
+      || /(?:^|\s)[\w-]*ad-banner[\w-]*(?:\s|$)/.test(cls)
+      || /(?:^|\s)[\w-]*banner-ad[\w-]*(?:\s|$)/.test(cls);
+  }
+
+  function cleanAdBanners() {
+    if (!CONFIG.hideAds) return 0;
+    let n = 0;
+    let nodes;
+    try { nodes = document.querySelectorAll(AD_BANNER_SEL); } catch (e) { return 0; }
+    (nodes || []).forEach((el) => {
+      if (!el || el.dataset.blfHidden) return;
+      if (!bannerIsAd(el)) return;   // 复核：不是真广告就放过
+      // 容器保护：一张 banner 不该挂着十几个视频链接
+      if (linkCount(el) > MAX_LINKS_PER_CARD) {
+        log('跳过疑似容器的广告位（含 ' + linkCount(el) + ' 个视频）');
+        return;
+      }
+      hideCard(el, '广告位(banner)', true);
+      n += 1;
+    });
+    return n;
+  }
+
+  function cardIsAd(card) {
+    if (!card || !card.querySelector) return false;
+    try {
+      // 属性 / 状态类命中即算
+      if (card.matches && card.matches(AD_MARK_SEL)) return true;
+      if (card.querySelector(AD_MARK_SEL)) return true;
+      // 角标文字命中
+      const labels = card.querySelectorAll ? card.querySelectorAll(AD_LABEL_SEL) : [];
+      for (let i = 0; i < labels.length; i++) {
+        const t = String((labels[i] && labels[i].textContent) || '').replace(/\s+/g, '');
+        if (AD_LABEL_TEXT.test(t)) return true;
+      }
+    } catch (e) { /* 选择器不支持就当作非广告 */ }
+    return false;
+  }
+
+
+  const LS_COUNTS = 'blf:counts';
+  const HARD_MARK = /营销词|价格锚点|顶级\+价格/;
+  const countedKeys = new Set();
+
+  function bumpQuality(mid, author, key, kind) {
+    if (!mid || countedKeys.has(key)) return;
+    countedKeys.add(key);
+    const bucket = kind === 'topic' ? 't' : 'q';
+    const threshold = kind === 'topic' ? 3 : 2;
+    let c = {};
+    try { c = JSON.parse(localStorage.getItem(LS_COUNTS) || '{}'); } catch { c = {}; }
+    if (store.has(mid)) return;
+    const k = bucket + ':' + mid;
+    c[k] = (c[k] || 0) + 1;
+    try { localStorage.setItem(LS_COUNTS, JSON.stringify(c)); } catch { /* 忽略 */ }
+    if (c[k] >= threshold) {
+      store.add(mid, author);
+      log('自动拉黑 UP 主:', author, mid,
+        '累计', c[k], '条', kind === 'topic' ? '指定话题内容' : '强营销内容');
+    }
+  }
+
+  // 档位 → 干预授权等级。纯展示用，不参与任何判定。
+  const IAL_LABEL = { off: 'IAL-0', light: 'IAL-1', balanced: 'IAL-2', aggressive: 'IAL-4' };
+  function ialOf(mode) { return IAL_LABEL[mode] || mode; }
+
+  /* ---------------------------- 计数徽章 ------------------------------ */
+  let badgeEl = null;
+  function updateBadge() {
+    if (!CONFIG.showBadge) return;
+    if (!document.body) return;
+    if (!badgeEl) {
+      badgeEl = document.createElement('div');
+      badgeEl.id = 'blf-badge';
+      badgeEl.style.cssText = [
+        'position:fixed', 'right:14px', 'bottom:14px', 'z-index:2147483000',
+        'padding:5px 10px', 'border-radius:14px', 'cursor:pointer',
+        'background:rgba(0,0,0,.62)', 'color:#fff', 'font-size:12px',
+        'font-family:-apple-system,sans-serif', 'line-height:1.5',
+        'user-select:none', 'backdrop-filter:blur(4px)',
+        'border:1px solid rgba(255,255,255,.18)',
+        'opacity:.55', 'transition:opacity .2s',
+      ].join(';');
+      badgeEl.title = CALLSIGN + ' ' + TERMINAL_ID + ' · 审核核（守 II 型接触宪法）\n'
+        + '点击查看 / 收起审核日志 · v' + VERSION;
+      badgeEl.addEventListener('mouseenter', () => { badgeEl.style.opacity = '1'; });
+      badgeEl.addEventListener('mouseleave', () => { badgeEl.style.opacity = '.55'; });
+      badgeEl.addEventListener('click', () => showPanel());
+      document.body.appendChild(badgeEl);
+    }
+    const hid = stats.apiHidden + stats.domHidden;
+    const seen = stats.apiSeen + stats.domSeen;
+    if (degradedActive()) {
+      badgeEl.textContent = '🛡 ' + CALLSIGN + ' · 判定异常，退回观测 60s';
+      badgeEl.style.background = 'rgba(150,40,40,.85)';
+      return;
+    }
+    badgeEl.textContent = '🛡 ' + CALLSIGN + ' · ' + ialOf(CONFIG.mode)
+      + ' 拦 ' + hid + ' / 扫 ' + seen;
+  }
+
+  /* --------------------------- 拦截记录面板 --------------------------- */
+  // 卡片被隐藏后就看不见了，误杀无处申诉。这里留一份最近记录，
+  // 点徽章可以逐条查看原因，并对误杀点 ✅ 永久放行。
+  const recentHidden = [];
+  const MAX_RECENT = 60;
+
+  function recordHidden(info, verdict) {
+    if (!info || (!info.title && info.duration == null)) return;
+    const key = (info.mid || '') + '|' + (info.title || '');
+    if (recentHidden.some((r) => r.key === key)) return;
+    recentHidden.unshift({
+      key, mid: info.mid, author: info.author, title: info.title,
+      dur: info.duration, fp: verdict.fp, why: verdict.reason || '',
+      topic: verdict.topic || null,
+      ts: Date.now(),
+    });
+    if (recentHidden.length > MAX_RECENT) recentHidden.length = MAX_RECENT;
+  }
+
+  let panelEl = null;
+
+  function showPanel() {
+    if (panelEl) { panelEl.remove(); panelEl = null; return; }
+
+    const el = document.createElement('div');
+    el.id = 'blf-panel';
+    el.style.cssText = [
+      'position:fixed', 'right:14px', 'bottom:52px', 'width:420px',
+      'max-height:70vh', 'overflow:auto', 'z-index:2147483000',
+      'background:rgba(24,24,28,.96)', 'color:#eee', 'font-size:12px',
+      'font-family:-apple-system,sans-serif', 'line-height:1.6',
+      'border-radius:12px', 'padding:12px', 'box-shadow:0 8px 32px rgba(0,0,0,.5)',
+      'border:1px solid rgba(255,255,255,.14)', 'backdrop-filter:blur(8px)',
+    ].join(';');
+
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:8px';
+    const bl = Object.keys(store.all()).length;
+    const wl = Object.keys(allow.all()).length;
+    head.innerHTML = '<b>' + CALLSIGN + ' · 审核日志 ' + recentHidden.length + ' 条</b>' +
+      '<span style="opacity:.6;font-size:11px">' + TERMINAL_ID + ' · 否决 ' + bl + ' · 豁免 ' + wl + '</span>';
+    el.appendChild(head);
+
+    if (!recentHidden.length) {
+      const empty = document.createElement('div');
+      empty.style.cssText = 'opacity:.6;padding:12px 0';
+      empty.textContent = '这一屏，九天没找到该拦的。';
+      el.appendChild(empty);
+    }
+
+    recentHidden.forEach((r) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'padding:7px 0;border-top:1px solid rgba(255,255,255,.09)';
+
+      const title = document.createElement('div');
+      title.textContent = r.title || '(无标题)';
+      title.style.cssText = 'color:#fff;margin-bottom:2px';
+      row.appendChild(title);
+
+      const meta = document.createElement('div');
+      meta.style.cssText = 'opacity:.62;font-size:11px;display:flex;gap:8px;align-items:center';
+      const info = document.createElement('span');
+      info.textContent = (r.author || '?') + ' · ' + (r.dur != null ? r.dur + 's' : '?') + ' · fp=' + r.fp;
+      meta.appendChild(info);
+
+      // 主题命中的格外显眼：这不是"质量差"，是"你不看的题材"
+      if (r.topic) {
+        const tag = document.createElement('span');
+        tag.textContent = (TOPICS[r.topic] && TOPICS[r.topic].label) || r.topic;
+        tag.style.cssText = [
+          'background:rgba(210,110,60,.32)', 'color:#ffd9c2',
+          'border:1px solid rgba(255,150,100,.35)',
+          'border-radius:5px', 'padding:0 6px', 'font-size:10px',
+        ].join(';');
+        meta.appendChild(tag);
+      }
+
+      if (r.mid) {
+        const okBtn = document.createElement('button');
+        okBtn.textContent = '✅ 放行';
+        okBtn.title = '列入授权例外：该 UP 主此后永久豁免审核';
+        okBtn.style.cssText = [
+          'margin-left:auto', 'border:1px solid rgba(255,255,255,.25)',
+          'background:rgba(80,160,90,.3)', 'color:#d8ffd8', 'cursor:pointer',
+          'border-radius:6px', 'padding:1px 7px', 'font-size:11px',
+        ].join(';');
+        okBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          allow.add(r.mid, r.author);
+          // 立刻恢复这个 UP 主当前页面上被隐藏的所有卡片
+          document.querySelectorAll('a[href*="space.bilibili.com/' + r.mid + '"]')
+            .forEach((a) => {
+              const c = a.closest(CARD_SEL) || findCard(a);
+              if (c && c.dataset.blfHidden) {
+                c.style.removeProperty('display');
+                delete c.dataset.blfHidden;
+              }
+            });
+          row.style.opacity = '0.45';
+          okBtn.textContent = '已放行';
+          okBtn.disabled = true;
+        });
+        meta.appendChild(okBtn);
+      }
+      row.appendChild(meta);
+
+      if (r.why) {
+        const why = document.createElement('div');
+        why.textContent = r.why;
+        why.style.cssText = 'opacity:.45;font-size:10px;margin-top:1px';
+        row.appendChild(why);
+      }
+      el.appendChild(row);
+    });
+
+    document.body.appendChild(el);
+    panelEl = el;
+  }
+
+
+  /* ---------------------------- 主题屏蔽规则 ----------------------------
+     用户不想看的话题类别，与内容质量无关：一条拍得挺好的情感视频照样不要。
+     每类分三级：
+       strong —— 命中即拦（词本身足够专指这个题材）
+       weak   —— 需要同时命中 weakNeed 个才算（词有歧义，比如"分手"也可能是歌名）
+       exempt —— 命中则不拦（学术讨论、正经音乐、真运动项目等）
+     设计原则：宁可漏一点，也不能把正常内容大词一网打尽。          */
+  /* ---- 国产 / 海外 AI 厂商名（标题与账号名共用）----
+     这些词大多有同名的日常义，所以每条都带排除：
+
+       MiniMax  → CSS 的 minmax() 函数（grid 布局）
+       混元     → 道教 / 武术术语（混元一气、混元桩、混元太极）
+       智谱     → 智谱寺这类地名（用户自己也写成「智普」，两种都收）
+       GLM      → 广义线性模型（统计学）
+       豆包     → 北方面食（豆沙包、发面、蒸）
+
+     每个排除都对应一条实测样本，改动前先看 topic-test.js 的对应断言。 */
+  const VENDOR_RULES = [
+    // MiniMax：品牌名是 mini + max，中间有一个 i。
+    // **不收 minmax** —— 那是 CSS 的 minmax() 函数（grid 布局），
+    // 跟这家公司无关。写成 mini?-?max 会把 "min"+ "max" 也吃进去，
+    // 实际踩过：minmax 明明是排版术语，却被当作品牌名拦了。
+    // 现在的写法要求字面 "mini"，所以 MiniMax / minimax / MINIMAX / mini-max
+    // 都命中，而 minmax 不命中。
+    //
+    // 另一个同名坑：minimax 是博弈论 / 游戏 AI 的标准术语
+    // （minimax 定理、minimax 算法 + alpha-beta 剪枝）。
+    // 这些是正经的算法与数学内容，不是这家公司，必须排除。
+    /mini-?max(?!.{0,14}(?:定理|算法|博弈|决策论|极小极大|alpha-?beta|剪枝|五子棋|国际象棋|棋类|theorem|搜索树))/i,
+    // 混元：必须有 AI 语境词，否则是道教 / 武术
+    /混元(?=.{0,12}(?:模型|大模型|图像|视频|生图|对话|助手|开源|发布|评测|实测|部署|接口|API|智能体))/,
+    /(?:腾讯|混元).{0,10}(?:大模型|模型|图像|视频|生图|对话|助手|开源|API|接口)/,
+    // 智谱 / 智普：排除寺庙地名
+    /智[谱普](?!.{0,4}(?:寺|观|庙))/,
+    // 智谱的英文品牌名
+    /chatglm|glm-?\d/i,
+    // 豆包：排除面食语境
+    /豆包(?!.{0,10}(?:的做法|怎么蒸|馅|馒头|早餐|好吃|教程|豆沙|面团|发面|包法|面食))/,
+  ];
+
+  // 猫 meme 的稳定指纹：标题或 UP 名里带「猫meme」。
+  // 变体：猫meme / 猫猫meme / 猫咪meme / 喵meme / meme猫 / Cat meme，
+  // 中英文之间可能有空格。
+  const CAT_MEME = /(?:猫|喵)(?:猫|咪)?\s*meme|meme\s*(?:猫|喵)|cat\s*meme/i;
+
+  const TOPICS = {
+    ai: {
+      label: 'AI 内容',
+      strong: [
+        // 标题标注了 AI 就拦，不看时长和文案分数。
+        // 前后不能是英文字母：AirPods / Aimer / Rain / Detail / mail
+        // 这些词里的 "ai" 不是 AI 标注。中文标题里 AI 通常直接贴着汉字
+        // （AI绘画、用AI做），所以不能用 \b 做边界。
+        /(?<![a-z])ai(?![a-z])/i,
+        /aigc/i,        // AI 生成内容；AI 后面跟 G 会被上面的边界放过
+        /openai/i,      // 公司名，同样被上面的边界放过
+        /人工智能/,
+        // 4.13.0：不含 "AI" 字面、但属于同一类标注的写法。
+        // 200 次真实推荐流里出现了「12个大模型扮演君主」这类标题，
+        // 标题里完全没有 ai 三个字母，旧规则拦不住。
+        /chatgpt|midjourney|stable ?diffusion|deepseek|copilot(?!\s*pilot)/i,
+        // 4.19.0：Claude 此前根本不在词表里 —— 只带 Claude、不带 DeepSeek 的
+        // 标题全部漏网。Claude 也是法语人名，莫奈 / 德彪西要排除。
+        /claude(?!\s*(?:monet|debussy|莫奈|德彪西|shannon))/i,
+        // 其他模型名。每个都带排除：gemini 是双子座，kimi 是莱科宁，
+        // 豆包是吃的，文心 / 通义 单独当词太泛。
+        /gemini(?!\s*(?:座|星座|运势|今日|本周|下周))/i,
+        /kimi(?!\s*(?:räikkönen|raikkonen|莱科宁))/i,
+        // 4.28.0：MiniMax / 混元 / 智谱 此前完全没收录 ——
+        // 只写厂商名、不写「AI / 大模型」的标题全部漏网。
+        // 豆包原本单列在这里，现并入共享词表 VENDOR_RULES（排除更完整）。
+        ...VENDOR_RULES,
+        /文心一言|通义千问|qwen(?:\s*\d)?|grok(?!.{0,4}(?:异乡|海因莱因))/i,
+        /大模型|文生图|文生视频|生成式|智能体|提示词工程|AI生成/i,
+        // 4.17.0：AI 剧情短剧。这类标题常常一个 "AI" 字样都没有，
+        // 只写角色设定：「【赛博女友】我有可能"第一个"做出能"通过图灵测试"的蓝色大…」
+        // （标题本身还可能被 UP 主用省略号截断，「大模型」只剩「大。。。」）。
+        // 所以靠设定词识别，不靠 "AI" 字面。
+        /赛博(?:女友|男友|恋人|伴侣|老婆|老公|对象)/,
+        /(?:虚拟|电子)(?:女友|男友|恋人|伴侣)/,
+        // 第一人称造物叙事 + AI 概念：这是剧情片，不是科普。
+        // 保留「图灵测试能证明机器有意识吗」这类科普 —— 它没有造物动词。
+        /我.{0,12}(?:做出|造出|打造|创造|训练出|复刻|捏出).{0,16}(?:图灵测试|大模型|人工智能|数字生命|智能体|AI)/i,
+        // 4.23.0：「让 AI 看/读/评价 XX」的测试类内容。
+        // 「让Claude看B站恶搞它的表情包」「给AI看100张图，它全认出来了」。
+        // 这类标题常常不带模型名（「让它看看这些弹幕」），靠原来的词表漏网。
+        //
+        // 指定动词而不是裸「让AI」：动作词必须是人稿测试的那种（看/读/猜/打分），
+        // 所以「如何写好提示词：让AI输出更精准」不会被碰。
+        /(?:让|给|叫|拿给|丢给).{0,10}(?:AI|ai|模型|Claude|ChatGPT|DeepSeek|它|机器人).{0,14}(?:看|读|听|猜|辨认|识别|评价|点评|打分|挑战)/i,
+      ],
+      // 用户原话是「凡是名字中标注 ai 的都屏蔽」，所以不设 exempt。
+      exempt: [],
+    },
+
+    gender: {
+      label: '两性对立',
+      strong: [
+        /拳师|女拳|男拳/,
+        /田园女权|极端女权|女权婊/,
+        /直男癌|凤凰男|扶弟魔|妈宝男/,
+        /性别对立|男女对立|两性对立/,
+        // 彩礼：民法典/司法解释里的"彩礼返还"是法律解读，不是引战
+        /天价彩礼|彩礼(?!.{0,4}(?:返还|纠纷|司法解释|判决|民法典))/,
+        /剩女|剩男/,
+        /男人没一个好东西|女人都一个样/,
+        /男女.*(战争|对立|矛盾)/,
+        /男人的底线|女人的底线|男女博弈|男女关系|男女之间/,
+        /抢亲|婚礼现场.*(闹|抢)/,
+        // "现实"单独会咬到"现实主义题材"，只认跟钱直接挂钩的写法
+        /(女生|女孩|女人).*(结婚|物质|拜金)|(女生|女孩|女人).{0,6}(太现实|很现实|真现实)/,
+        /(男生|男孩|男人).*(结婚|物质|现实)/,
+        /不愿意结婚|不想结婚|结婚要多少/,
+
+        // 群体化的缺失断言：「女子落水没男人敢救」。
+        // 把一个个例上升成整个性别的品格指控，是性别引战最典型的模板。
+        // 必须「否定词 + 性别群体 + 意愿/行为动词」三者齐全：
+        // 「女子落水，外卖小哥跳水救人」是正面新闻，不能被碰。
+        /(没|没有|不见|找不到|少有)(一?个)?(男人|女人|男生|女生|男的|女的|男性|女性).{0,4}(敢|愿意|肯|站出|上前|伸手|帮忙|施救|救)/,
+        // 性别群体 + 「都/全」+ 定性评价，同样是拿个例给整个性别定罪。
+        // 负面词表必须写死："女生都喜欢的穿搭" 是正常内容，不得命中。
+        /(男人|女人|男生|女生|男的|女的)(都|全|个个|基本|一律)(没担当|靠不住|不行|废物|自私|孬种|懦弱|胆小|没责任心|不值得|装看不见|装没看见|袖手旁观|视而不见|冷眼旁观)/,
+
+        // 伪新闻式性别猎奇：「欧盟要求组建全女社会」这一类。
+        // 套路是拿一个外部权威 + 一个性别排他的荒谬政策，拼成耸动的标题。
+        // 只看结构，不看真实与否 —— 这类标题本身就不是可以讨论的命题。
+        //
+        // A. 全女 / 纯女 + 社会形态。限定在社会/国家/世界，
+        // 不碰「全女班话剧」「全女阵容综艺」（那是阵容，不是社会制度）。
+        /全女(社会|国家|世界|乌托邦|政权|城邦)/,
+        // B. 性别群体被整体驱逐/清洗。必须有整体化修饰词：
+        // 「美国男性失业率创新高」是经济新闻，没有「集体/全部」不会被碰到。
+        /(男性|男人|男子|男生).{0,4}(集体|全部|统统|一律|全被|将被|会被).{0,4}(驱逐|消灭|清除|灭绝|赶走|驱逐出境|排斥|禁入)/,
+        // C. 权威主体 + 性别排他政策。「全国/国家」必须出现：
+        // 「这家公司只招女性」是就业歧视个案，归劳动法讨论，不归这里。
+        /(欧盟|联合国|某国|官方|政府|国家|全国).{0,12}(要求|宣布|规定|立法|通过|下令|决定).{0,12}(全女|只招女|只收女|只录女|禁止男|驱逐男|男人禁入|女性专属)/,
+        // D. 「未来世界由女性主导」这类人类命运叙事。
+        // 限定在世界/未来/人类社会：「这个行业由女性主导」是产业描述，不碰。
+        /(世界|未来|整个人类|人类社会).{0,8}(由|将由|该由|交给)(女性|女人)(来)?主导/,
+      ],
+      // 全部改成语境限定：裸的"两性"会咬"两性物质"（化学），
+      // 裸的"物质"会咬"物质结构"（物理）。
+      weak: [/男女(?:关系|对立|矛盾|情感)/, /两性(?:关系|话题|对立|情感|交往)/,
+             /性别(?:对立|歧视|议题|争议)/, /结婚(?:率|成本|要求|条件)/,
+             /婚恋/, /物质(?:女|条件|要求)/, /拜金/],
+      weakNeed: 2,
+      exempt: [
+        /拳击|格斗|散打|UFC|MMA|搏击|拳台/,          // 真运动，不是"打拳"
+        /社会学|人类学|性别研究|学术|论文|社会调查/,   // 严肃讨论
+        /人口学|人口统计|人口结构|调研报告|研究报告|数据分析/,
+        /平权|同工同酬|女性权益/,
+      ],
+    },
+
+    relationship: {
+      label: '情感关系',
+      strong: [
+        // 小三：必须排除小三和弦 / 小三度（乐理）和小三阳（医学）
+        /出轨|劈腿|婚外情|绿帽|小三(?!和弦|度|阳)/,
+        /恋爱脑|情感导师|情感专家|PUA/,
+        /婆媳|婆婆和媳妇|媳妇和婆婆|婆家|娘家妈|离婚冷静期|婚内/,
+        // 绿茶是茶，白莲是植物/白莲教；只认带人身指向的写法
+        /渣男|渣女|绿茶婊|绿茶(?:男|女|行为|发言)|白莲花|白莲婊/,
+        /异地恋|相亲角|相亲市场|相亲对象/,
+        /恋爱多年|恋爱五年|恋爱三年/,
+        // 4.36.0：婚恋裸词一律杀（用户 2026-11-06 改口）。
+        // 原来这类只走 weak 累计，并靠 exempt 把「婚姻登记数据」「人口学报告」
+        // 抽回去 —— 用户举的样本「结婚人数，再次下降」正好被那条豁免放过。
+        // 现在改成：只要标题在讲结婚 / 离婚 / 婚姻这件事，不分新闻、数据、
+        // 学术、纪录片，一律不看。用户的偏好优先于「不误伤知识内容」的通则。
+        //
+        // 用单字「婚」而不是列举词：汉语里「婚」只有婚姻一个义项，
+        // 列举词会一直漏（先漏「不婚主义」，再漏「催婚」「闪婚」「金婚」）。
+        // 单字一次性盖完：结婚 / 离婚 / 婚姻 / 婚礼 / 婚纱 / 婚庆 / 婚介 /
+        // 征婚 / 婚检 / 婚房 / 不婚 / 逼婚 / 再婚 / 冥婚 / 婚变……
+        /婚/,
+        // 体验帖："恋爱 + 是什么体验"的乎体/小红书写法。
+        // 信息量为零，卖点就是私生活本身。（"在故宫修文物是怎样的体验"
+        // 没有恋爱词，不会被这条碰到）
+        /(谈恋爱|恋爱|在一起|结婚|相亲|约会|同居|嫁人|娶妻|嫁给|娶了|嫁入).{0,10}(是什么|是怎样|是怎么样|怎样的|什么样的).{0,3}(体验|感觉|感受)/,
+        // 身份攀附叙事：和富二代/豪门/明星谈恋爱。
+        // 这类标题的重心不是人，是阶层与光环，属于最典型的消耗性内容。
+        // 删掉"大哥"和"在一起"："和东北大哥在一起吃烧烤"不是情感内容
+        /(和|跟|与).{0,4}(富二代|富婆|富家女|富家子|豪门|有钱人|大老板|明星|顶流|爱豆|海王|校草|校花|富哥).{0,6}(谈恋爱|恋爱|约会|结婚|交往)/,
+        /(嫁|娶)(给|入).{0,6}(有钱人|豪门|富二代)/,
+        /谈恋爱/,
+      ],
+      // 注意：weak 必须一词一正则。写成 /a|b|c/ 只算 1 个命中，weakNeed 永远达不到。
+      weak: [/分手/, /复合/, /前任/, /暗恋/, /表白/, /相亲/, /异地恋/, /备胎/, /暧昧/, /恋爱/, /约会/, /择偶/],
+      weakNeed: 2,   // 两个词同时出现才拦；单个词在歌名影评里太常见
+      exempt: [
+        /MV|PV|OP|ED|翻唱|歌曲|歌单|纯音乐|钢琴|吉他|演唱/,
+        /心理学|心理学研究|依恋理论/,
+        // 4.36.0 删掉了原来的两条豁免：
+        //   /电影|剧集|影评|纪录片|短片|动画/
+        //   /社会学|人口学|经济学|人类学|人口统计|婚姻登记|调研报告|数据分析|研究报告/
+        //
+        // 保留它们会让婚恋题材只是换层皮就溜过去：
+        // 「【纪录片】婚恋市场的经济学」「婚姻登记数据十年变化」都是。
+        // 用户要的是题材全不看，形式（新闻 / 数据 / 学术 / 纪录片）不是豁免理由。
+        //
+        // 音乐豁免留着：歌名里的「分手」「恋爱」是作品名，不是叙事。
+        // 实际影响靠 weakNeed 撑着 ——「《分手快乐》现场版」只命中 1 个 weak，不拦。
+        //
+        // 「社会调查」也一并删了（原 exempt 有它）。它比「调研报告」更宽，
+        // 会把「青年婚恋观社会调查」这类叙事大片放过；用户的意图是题材全不看。
+      ],
+    },
+
+    exam: {
+      label: '考公考研',
+      strong: [
+        // "国考"要排除"中国考古"——"中-国考-古"会让三星堆、青铜器、
+        // 断代这类考古内容被当成公考培训。实际踩过。
+        // 国考要排"中国考古/中国考试"，公考要排"老公考虑" ——— 两端都要边界
+        /考公|(?<![老中韩美英法])公考(?![虑])|(?<![中韩美英法])国考(?![古试生])|省考|事业编|选调生/,
+        // 初试/复试 不能单独作为强规则：「化学实验的初试与复试：分步滴定」
+        // 会被当成考研培训（实际踩过）。真正的考试场景已由 /考研/ 覆盖，
+        // 这里只保留组合词的写法。
+        /考研|调剂|复试调剂|初试成绩|复试分数线/,
+        /押题|保过|包过|一对一辅导|培训班|网课|冲刺班/,
+        /选岗|报考指南|岗位表|招录/,
+      ],
+      weak: [/备考/, /复习/, /真题/, /模拟题/, /面试技巧/, /上岸/],
+      weakNeed: 2,
+      exempt: [/大学|高校|教务处|招生简章(?!.*(培训|押题))/],
+    },
+
+    accident: {
+      label: '车祸事故',
+      strong: [
+        // 相撞：粒子对撞、分子碰撞都是物理内容，只在交通语境下算
+        // 相撞：物理语境（粒子相撞、分子相撞）要用 lookbehind 排除。
+        // 只写成相撞(?!粒子) 是错的 —— "粒子"在"相撞"前面。
+        /车祸|交通事故|追尾|撞车|肇事|(?<!粒子)(?<!分子)(?<!原子)(?<!天体)(?<!星系)相撞/,
+        /事故现场|行车记录仪|监控拍下|监控视频/,
+        /血肉模糊|惨烈|当场死亡/,
+        // 大货车：盲区科普 / 司机职业记录是正常内容，只认事故写法
+        /千万别跟车|别跟太近|大货车(?:侧翻|追尾|碾压|肇事|事故|逆行)/,
+      ],
+      weak: [/失控/, /撞上/, /撞击/, /翻车/],
+      weakNeed: 2,
+      exempt: [
+        /交通安全|交通法规|道路设计|安全驾驶|事故统计|事故率|盲区|货车司机/,
+        /责任认定|法条|立法|保险理赔|理赔流程/,
+        /选购|测评|评测|开箱|推荐|怎么选/,   // 行车记录仪选购之类是数码内容
+        /翻车/,      // 网络语"翻车"=出糗，不算车祸；单独出现在 weakNeed 里也不够
+      ],
+    },
+
+    comedy: {
+      label: '搞笑段子',
+      strong: [
+        /沙雕|整活|鬼畜|段子/,
+        /笑死|笑不活|笑麻|笑到头掉|笑出猪叫/,
+        /迷惑行为|人类迷惑|离谱操作/,
+        /承包.{0,6}笑点/,
+      ],
+      weak: [/搞笑/, /魔性/, /爆笑/],
+      weakNeed: 2,
+      exempt: [
+        /搞笑诺贝尔|Ig.?Nobel/,   // 正经科普，名字里带"搞笑"
+        /相声|脱口秀|小品|喜剧电影|情景喜剧|喜剧片/,
+        // 在讨论"怎么做出搞笑内容"，而不是搞笑内容本身
+        /教程|怎么做|怎么制作|后期|幕后|创作|编剧|版权|分镜|剪辑技巧/,
+      ],
+    },
+
+    // ---- AI 剧情短剧：让模型谈恋爱 / 拟人化的烂剧情 ----
+    // 「【Claude】大小姐，是时候说再见了」「Claude 大小姐的一百种撒娇方式」
+    // 「让 Claude 和 DeepSeek 谈恋爱」。
+    //
+    // 与 ai 类分工：ai 类判「标题里有没有模型名」，这一类判「模型名被当成角色在用」。
+    // 「Claude 3.7 到底强在哪」归 ai，「Claude 大小姐撒娇」归这里 ——
+    // 面板报出的原因更准。
+    // ---- AI 模型账号：UP 名标注了模型名，整号不看 ----
+    // 「DeepSeek深度观察」「Claude每日一笑」「AI绘画教程」这类账号，
+    // 产出全是同一个模型的搬运 / 拟人短剧 / 教程切片。
+    //
+    // 判定只看 UP 名，不看标题 —— 标题规则已经在 ai / aiDrama 两类里。
+    // 账号名是最稳的指纹：改标题容易，改号得重新养粉。
+    //
+    // 注意：matchTopic 里 author 命中先于 exempt，所以同名排除必须写在
+    // 正则内部，不能靠 exempt 兜底。
+    aiAccount: {
+      label: 'AI模型账号',
+      // 标题规则留空：这一类纯粹是账号维度的判定。
+      strong: [],
+      author: [
+        /deepseek/i,
+        // Claude 也是法语人名（莫奈 / 德彪西 / 香农）
+        /claude(?!\s*(?:monet|debussy|莫奈|德彪西|shannon))/i,
+        /chatgpt|openai|gpt-?\d/i,
+        // Gemini 也是双子座：账号名里带星座的直接放过
+        /^(?!.*(?:星座|占星|双子座)).*gemini/i,
+        /midjourney|stable\s?diffusion/i,
+        // Kimi 也是莱科宁
+        /kimi(?!\s*(?:räikkönen|raikkonen|莱科宁))/i,
+        // 4.28.0：MiniMax / 混元 / 智谱 的账号名不含 "ai" 子串，
+        // 光靠下面的裸 /ai/ 抓不到 —— 「MiniMax 官方」「混元实验室」会漏。
+        //
+        // 账号维度不能直接复用 VENDOR_RULES 的混元规则：
+        // 那条要求「混元 + 模型/图像/发布…」的句子语境，而账号名通常只有一个词
+        // （「混元实验室」），语境词永远凑不齐。改判「混元 + AI 类后缀」，
+        // 这样「混元太极」「混元桩」这类武术 / 道教账号仍能放过。
+        ...VENDOR_RULES.filter((re) => re.source.indexOf('混元') < 0),
+        /混元(?:.{0,8}(?:实验室|官方|科技|智能|团队|研究院|工作室|AI|ai|模型|大模型|智能体))/,
+        /(?:腾讯|混元).{0,6}(?:大模型|模型|AI|ai)/,
+        /文心一言|通义千问|qwen|grok|copilot/i,
+        // 中文泛称
+        /大模型|人工智能|AIGC/i,
+        // 裸 AI：用户明确要求「制作者名字里含 ai、AI 的都杀掉」。
+        // 这里**不加单词边界** —— 与标题类有意不同：
+        //   标题保留边界，因为 Detail / Rain / Mail 在正文里太常见；
+        //   账号名全杀，因为用户要的就是“名字里带 ai 的号一个不留”。
+        //
+        // 代价是 Aimer / Rain / Kaito / Aiko / Bailey 这类账号会被误杀。
+        // 这是明确取舍，不是 bug：遇到要留的，在面板里点 ✅ 放行该 UP。
+        /ai/i,
+      ],
+      // 不设标题豁免：这一类只靠 author，exempt 对 author 不生效。
+      exempt: [],
+    },
+
+    aiDrama: {
+      label: 'AI剧情短剧',
+      strong: [
+        // 模型名 + 拟人化剧情词，两类必须同时出现。
+        // 重复写三次剧情词是必需的：lookahead 只做断言不吃字符，
+        // 末尾不写就没有实际匹配内容，hit 会是空字符串。
+        /(?=[^。]*(?:claude(?!\s*(?:monet|debussy|莫奈|德彪西))|chatgpt|gpt-?\d|deepseek|gemini|文心一言|豆包|kimi|通义千问|qwen|grok|llama|copilot|大模型|人工智能|(?<![a-z])ai(?![a-z])))(?=[^。]*(?:拟人|CP|谈恋爱|恋爱|恋情|撒娇|傲娇|大小姐|大少爷|在一起|分手|告白|表白|结婚|吃醋|的日常|角色扮演|对戏))[^。]*(?:拟人|CP|谈恋爱|恋爱|恋情|撒娇|傲娇|大小姐|大少爷|在一起|分手|告白|表白|结婚|吃醋|的日常|角色扮演|对戏)/i,
+        // 纯对白式：称呼 + 逗号 + 告别台词。
+        // 「大小姐，是时候说再见了」—— 标题里一个 AI 字样都没有，
+        // 但这就是 AI 角色对戏短剧的标准命名法。
+        // 限定「以称呼开头」：正文里的「...像大小姐，是时候说再见了」不会被碰。
+        /^(?:大小姐|大少爷|主人|少爷|小姐|哥哥|姐姐|老公|老婆|宝贝|亲爱的)[，,、]\s*.{0,14}(?:是时候|该|要)?(?:说再见|再见了|告别|离开了|别走|不要走|我走了)/,
+
+        // 4.31.0：鲸鱼拟人剧。DeepSeek 的吉祥物是鲸鱼，
+        // 所以「小鲸鱼混进人类社会」这类就是它的同人短剧，
+        // 标题里一个字都不提 AI / DeepSeek。
+        //
+        // 判据不能是裸「鲸鱼」—— 鲸鱼科普是正经内容。
+        // 必须同时满足：**拟人化称呼** + **人类世界 / 拟人动作**。
+        //   拟人化称呼：小鲸鱼 / 鲸鱼们 / 鲸宝 / 鲸鱼宝 / 鲸崽 / 鲸鱼崽 /
+        //               蓝鲸宝宝 / 鲸鱼宝宝 / 小鲸崽
+        //               —— 正经科普写的是「鲸鱼」「鲸类」「座头鲸」，不会用这种叠词
+        //   人类语境：人类 / 人间；或 混进 / 潜入 / 伪装 / 模仿 / 观察 等
+        //
+        // 所以「鲸鱼是哺乳动物吗」「人类捕鲸史」「鲸鱼搁浅后人类如何救援」
+        // 都不会命中 —— 它们没有拟人化称呼。
+        /(?=[^。]*(?:小鲸鱼|鲸鱼们|鲸宝|鲸鱼宝|鲸崽|鲸鱼崽|蓝鲸宝宝|鲸鱼宝宝|小鲸崽))(?=[^。]*(?:人类|人间|混进|混入|潜入|融入|伪装|假装|扮成|装成|模仿|观察))[^。]*(?:人类|人间|混进|混入|潜入|融入|伪装|假装|扮成|装成|模仿|观察)/,
+      ],
+      exempt: [
+        // 真作品里的角色：动漫 / 影视 / 小说 / 同人。
+        // 书名号是最强的标记；「番剧 / 新番 / 角色分析」也算。
+        /《.+》|动漫|动画|番剧|新番|番推荐|剧场版|漫画|轻小说|同人|声优|角色分析|人物志|cos|手书|MAD/,
+      ],
+    },
+
+    // ---- 猫 meme：用猫图配剧情旁白的短视频 ----
+    // 标题常常只写剧情（「当进京赶考的举人被劫后」），一个「猫」字都没有；
+    // 这类账号的 UP 名（星星猫meme剧场 / 小瑶的猫meme）才是稳定指纹。
+    // 所以这一类同时看标题和 UP 名 —— 只靠标题会漏掉用户实际看到的那条。
+    meme: {
+      label: '猫meme',
+      strong: [CAT_MEME],
+      // 标题没写「猫meme」也拦：整个账号产出的都是同一类内容。
+      author: [CAT_MEME],
+      // 用户要的是整类不看，不设 exempt。
+      exempt: [],
+    },
+
+    // ---- 以下为"粗俗 / 低质娱乐"类：用户目标是获取知识，这些已偏离 ----
+
+    // ---- 死亡猎奇：拿死亡方式当卖点的新闻 / 搬运 ----
+    // 「爱泼斯坦案关键举报人…被发现在家中上吊身亡」这类。
+    // 与 vulgar 的区别：vulgar 判的是“恶心、擞边”，这一类判的是
+    // **把别人的死亡当奇观看**。题材不同，exempt 也不同，所以单开一类。
+    //
+    // 判据是结构而非具体事件：死亡方式 + 结果，或遗体 / 遗书 / 死因的曝光式写法。
+    // 正经讨报（逝世 / 病逝 / 享年）不会命中 —— 它是死亡方式猎奇，不是死亡本身。
+    deathBait: {
+      label: '死亡猎奇',
+      strong: [
+        // 死亡方式 + 结果：上吊身亡 / 跳楼自杀 / 割腕死亡 / 烧炭自杀
+        /(?:上吊|自缢|跳楼|跳桥|跳江|卧轨|割腕|服毒|烧炭|投河).{0,10}(?:身亡|自杀|死亡|去世|丧命|致死)/,
+        // 遗体 / 遗书 / 死因的曝光式写法
+        /(?:遗体|尸体|遗书|死因).{0,6}(?:曝光|被发现|成谜|不明|披露|公布|找到了?)/,
+        // 「被发现在家中身亡」
+        /(?:被发现|惊现).{0,8}(?:身亡|死亡|遗体|尸体|上吊|自杀)/,
+      ],
+      exempt: [
+        // 自杀预防 / 心理健康：这些正是在处理这个问题，不是围观
+        /自杀预防|自杀干预|防自杀|危机干预|心理援助|援助热线|心理健康|抑郁症|双相|精神科|心理咨询/,
+        // 法医 / 医学：死亡方式本身是研究对象
+        /法医|尸检|病理|死亡时间|死亡鉴定|医学|解剖|司法鉴定/,
+        // 影视 / 文学里的死亡
+        /电影|剧集|影评|纪录片|动画|角色|剧本|小说|文学|剧情/,
+        // 正经讨报与纪念
+        /逝世|病逝|享年|追悼|纪念|周年|惖念/,
+        // 保险 / 法律：身歅理赔、遗产继承是事务性内容
+        /保险|理赔|遗产|继承|法律|判决/,
+      ],
+    },
+
+    vulgar: {
+      label: '低俗粗鄙',
+      strong: [
+        // 猎奇死亡 / 身体伤害的围观
+        // 尸体：考古 / 法医 / 博物馆里的古代遗体是知识内容
+        /被电死|触电身亡|惨死|死状|尸块|裹尸|尸体(?!.{0,8}(?:不腐|保存|墓葬|出土|考古))/,
+        // 排泄物与恶心物。
+        // 注意不能写裸的 /尿/ /呕吐/ —— 医学内容遍地都是这两个字：
+        // 「尿液检查能看出什么」「恶心呕吐的神经反射机制」都曾被误杀。
+        // 只认带贬义/场景限定的写法。
+        /粪坑|屎|尿坑|尿裤子|尿骚|随地小便|呕吐物|吐了一地|蛆|蟑螂窝/,
+        // 低俗擦边
+        // 擦边球是乒乓球术语，裸的"擦边"必须限定为软色情语境
+        /擦边(?:视频|直播|写真|内容|主播|舞|照)|软色情|福利姬|走光|偷拍|裙底|内衣秀|裸泡|真裸|脱衣/,
+        // 粗口
+        // 妈的：排除「妈妈的」——「做妈妈的菜」曾被当成粗口（实测踩到）。
+        // 真粗口「他妈的 / 你妈的 / 妈的」前面都不是"妈"，因此不损失召回。
+        //
+        // 4.39.0：再排除「我妈的」。「我妈的故事」「我妈的确很累」里的
+        // 「我妈的」不是粗口，但前一个字是「我」不是「妈」，旧规则拦不住。
+        // 注意不能连「你」一起排 ——「你妈的」就是真粗口，必须留。
+        /傻逼|智障|狗东西|滚你|(?<![妈我])妈的|操你/,
+      ],
+      weak: [/裸/, /脱/, /恶心/, /变态/, /猥琐/],
+      weakNeed: 3,
+      exempt: [
+        // 严肃内容：医学、法医、环保、生物、解剖
+        /医学|医生|医院|临床|病理|解剖|法医|尸检|尸僵/,
+        // 检验 / 生理："尿液检查""恶心呕吐的神经反射"属于这类
+        /检查|化验|检验|泌尿|消化|代谢|神经反射|生理学|症状/,
+        /污水处理|下水道工程|环卫|环境保护|垃圾分类/,
+        /昆虫|生物学|生态学|昆虫学|物种/,
+        // 正经的性教育 / 两性健康科普
+        /性教育|性健康|生殖健康|妇科|男科|避孕|防性侵|自我保护/,
+        // 影视作品里的正常讨论
+        /影评|剧评|解说|剧情|角色分析/,
+      ],
+    },
+
+    // ---- 外国人爽文：老外被中国震撼的固定模板 ----
+    // 这类标题的信息量为零，卖的是民族情绪：外籍身份 + 中国对象 +
+    // 强烈情绪反应，三者同时出现才算。单有"老外"或单有"震惊"都不拦
+    // —— 真正的外国人生活 vlog 不这么写标题。
+    // ---- 外网搬运：把推特 / Reddit / 外网的帖子翻成中文念一遍 ----
+    // 「推特热帖：当外国人发现中国的打印价格相当低廉后」这类。
+    // 内容本身是别人的帖子，UP 只做翻译与旁白，信息量为零。
+    //
+    // 判据是两个条件同时成立，顺序不限：
+    //   1. 来源：平台名（推特 / Reddit / 油管 …）或泛指（外网 / 国外论坛 / 外国网友）
+    //   2. 形态：热帖 / 高赞 / 热议 / 搬运 / 翻译 / 评论区 …
+    // 单有平台名不够 —— 「推特治国」「TikTok 在美国的监管困境」是正经新闻与分析；
+    // 单有「热帖」也不够 —— B 站自己的「贴吧热帖」不是外网搬运。
+    repost: {
+      label: '外网搬运',
+      strong: [
+        /(?=[^。]*(?:推特|Twitter|Reddit|油管|YouTube|TikTok|4chan|Quora|Instagram|脸书|Facebook|Telegram|境外网站|境外平台|外网|国外论坛|海外论坛|外国论坛|日本论坛|韩国论坛|美国论坛|德国论坛|俄罗斯论坛|印度论坛|欧洲论坛|国外社区|海外社区|外国网友|老外网友|海外网友|国外网友|外国网民))(?=[^。]*(?:热帖|热评|高赞|热议|刷屏|疯传|吵翻|炸锅|搬运|转载|翻译|熟肉|字幕组|评论区|留言区|网友评论|都在说|怎么看|反应|直呼|看呆|看傻|笑疯))[^。]*(?:热帖|热评|高赞|热议|刷屏|疯传|吵翻|炸锅|搬运|转载|翻译|熟肉|字幕组|评论区|留言区|网友评论|都在说|怎么看|反应|直呼|看呆|看傻|笑疯)/i,
+      ],
+      // 不设 weak：单有来源词就拦会把「TikTok 监管」「推特算法」这些正经内容误杀。
+      exempt: [
+        // 平台本身作为研究对象：算法、商业模式、监管、产品设计
+        /算法|推荐系统|商业模式|营收|财报|盈利|产品设计|产品经理|创业史|公司史|监管|法案|诉讼|隐私|数据泄露|技术架构|技术栈|开源|反垄断/,
+        // 学术形态
+        /论文|研究|报告|综述|学术|社会学|传播学|新闻学|媒介研究/,
+        // 教你怎么用平台，不是搬内容
+        /教程|怎么注册|注册流程|账号被封|涨粉|运营|投放|广告/,
+        // 讨论「评论区」这个现象本身，而不是搬评论
+        /评论区.{0,8}(文化|生态|机制|设计|心理|治理|为什么|研究)/,
+      ],
+    },
+
+    foreignAwe: {
+      label: '外国人爽文',
+      // 顺序无关的三重条件：用 lookahead 分别确认三类信号都出现，
+      // 末尾再真实吃掉情绪词，这样面板能显示出命中的那段文字。
+      strong: [
+        /(?=[^。]*(?:老外|外国人|外国网友|外国小哥|外国姑娘|洋人|洋女婿|海外博主|留学生|美国|日本|韩国|德国|法国|英国|俄罗斯|印度|越南|以色列|老美|小日子|泡菜国|毛子))(?=[^。]*(?:中国|中华|华夏|国产|国内|中餐|中国菜|高铁|故宫|长城|中医|汉字|兵马俑|中国制造))[^。]*(?:后背发凉|头皮发麻|汗流浃背|不寒而栗|发凉|震惊|惊呆|傻眼|全程沉默|当场沉默|陷入.{0,2}沉默|沉默了|破防|泪目|看哭|哭死|跪了|直呼|不敢相信|心服口服|肃然起敬|震撼不已|震撼到|被震撼|彻底震撼|佩服不已|吓到|愣住|感叹不已|惊叹|自愧不如|无地自容|睡不着|害怕|恐惧|心惊)/,
+      ],
+      weak: [/老外/, /外国人/, /外国网友/, /洋人/, /海外博主/],
+      weakNeed: 3,   // 光有身份词不够，三个不同指代同时出现才停
+      exempt: [
+        // 正经研究 / 课程 / 报道，不是情绪爽文
+        /论文|文献学|汉学|史学|史料|学术|研讨会|期刊|研究综述|研究报告/,
+        /纪录片|访谈|讲座|公开课|课程/,
+        /外交部|大使|总统|峰会|谈判|条约|白皮书|智库|政策|商务部|外交|发言人|记者会|联合国|安理会|国防部/,
+        /留学政策|留学生签证|签证|移民政策|出入境|国籍法/,
+      ],
+    },
+
+    gossip: {
+      label: '娱乐八卦',
+      strong: [
+        /绯闻|恋情曝光|官宣恋情|分手内幕|离婚内幕|塌房|实锤/,
+        // "爆料"单用太宽（游戏技能爆料、新品爆料），必须带八卦语境
+        /(恋情|婚变|私生活|黑料|丑闻|内幕).{0,4}爆料|爆料.{0,4}(恋情|婚变|私生活|黑料|丑闻)/,
+        /偷腥|夜会|密会|同回酒店|恋情坐实/,
+        /红毯|颁奖礼.*(造型|翻车|比美)/,
+        /私生活|情史|黑料|污点/,
+        // 明星动态：不带"恋情/塔房"这类硬词，但仍然是同一类内容
+        /凭什么红|为什么这么红|解散后|退圈|复出|翻红|素颜|生图/,
+      ],
+      weak: [/明星/, /网红/, /爱豆/, /顶流/, /流量/, /瓜/, /吃瓜/, /热搜/],
+      weakNeed: 2,
+      exempt: [
+        // 影视作品本身的讨论
+        /影评|剧评|影史|作品|角色|演技|导演|编剧|摄影|配乐|票房/,
+        /产业|市场|商业模式|经纪公司|偶像工业|粉丝经济/,
+        /纪录片|访谈|专访|演讲/,
+        // 游戏 / 数码领域的"爆料"完全是另一回事
+        /游戏|手游|端游|干员|角色|技能|版本|更新|前瞻|预告/,
+        /数码|新品|发布会|评测|开箱|显卡|手机/,
+      ],
+    },
+
+    hustle: {
+      label: '搞钱割韭菜',
+      strong: [
+        /副业|躺赚|睡后收入|被动收入|副业刚需/,
+        /月入过万|月入十万|年入百万|日入\d+|轻松赚/,
+        /暴富|一夜暴富|财富自由|搞钱|教你赚钱|带你赚钱/,
+        // 裂变：核裂变是物理，只认营销语境
+        /割韭菜|知识付费|私域|引流|裂变(?:营销|增长|获客|模式|玩法)|变现/,
+        // "入门"混进赚钱组会让所有入门教程中招（0基础入门机器学习）
+        /(?:0|零)基础.{0,8}(?:赚钱|月入|变现|带货|副业)|宝妈.{0,6}(?:赚钱|副业)/,
+        // 薪酬落差叙事：「月薪三千活出月入三万」
+        // 数字可能是阿拉伯数字也可能是汉字（三千/三万），两种都要认。
+        /(?:月薪|工资|月入|年入|年薪)(?:\d+|[一二三四五六七八九十百千万]+).{0,10}(?:活出|过成|变成|实现|赚到).{0,6}(?:月入|年入|年薪)?(?:\d+|[一二三四五六七八九十百千万]+)/,
+        // 荐股 / 喊单：这类会伪装成财经分析，必须单独拦
+        /(股票|个股|基金|大盘|A股).{0,6}(暴涨|涨停|翻倍|上车|推荐|看好|翻身)/,
+        /(?:满仓|清仓|抄底|加速上车|赶紧上车)/,
+        /(内幕|小道|独家)消息.{0,6}(股票|基金|大盘|个股)/,
+      ],
+      weak: [/兼职/, /理财/, /投资/, /创业/, /课程/, /训练营/],
+      weakNeed: 3,
+      exempt: [
+        // 正经的经济 / 商业 / 金融内容
+        /经济学|金融学|宏观|微观|货币政策|财政|通货膨胀/,
+        /商业模式|企业史|公司史|创业史|商业分析|财报/,
+        /投资学|资产配置|风险管理|价值投资|指数基金/,
+        /理财规划|家庭财务|记账|储蓄/,
+      ],
+    },
+
+    // ---- 成功学 / 认知觉醒：阶层揭秘叙事的固定模板 ----
+    // 「身处顶尖 0.01% 的人群，我发现他们想的和普通人完全不一样」
+    // 这类内容的卖点是“我掌握了你不知道的阶层真相”，信息量为零，
+    // 且通篇不可证伪 —— 既不是知识，也不是经验分享。
+    //
+    // 为什么单开一类而不并入 hustle：hustle 卖的是赚钱方法（可核查），
+    // mindset 卖的是身份焦虑（不可核查）。混在一起会让面板里的原因不准。
+    mindset: {
+      label: '成功学话术',
+      strong: [
+        // 百分比人群：这类标题最硬的指纹
+        // 百分比人群必须跟财富/阶层共现 —— 否则"60%的人睡眠不足"会被误杀
+        /\d+(?:\.\d+)?\s*%\s*的?(?:人群|人|精英|富豪|富人|家庭).{0,12}(?:财富|收入|资产|阶层|精英|富人|赚钱)/,
+        /(?:顶尖|顶级|头部|上层|高净值).{0,4}(?:人群|精英|富豪|富人|阶层|家庭|的人|\d+\s*%)/,
+        // 认知叙事
+        /认知觉醒|认知升级|认知差异|认知层级|认知维度|认知迭代|升维|降维打击/,
+        /富人思维|穷人思维|有钱人.{0,4}思维|成功者.{0,4}思维|强者思维|弱者思维/,
+        /(?:富人|有钱人).{0,8}(?:穷人|普通人).{0,8}(?:思维|想法|差距|区别|差异)/,
+        // 层级叙事
+        // 底层逻辑在技术写作里是标准搭配（"MySQL索引的底层逻辑"），必须限定主语
+        /(?:阶层|财富|赚钱|成功|人生|认知|富人|穷人)的?底层逻辑|底层认知|顶层思维|阶层跨越|阶级跨越|阶层跃迁|圈层突破|破圈|向上生长/,
+        // 认知剥削叙事
+        /信息差|认知以外|赚不到.{0,6}认知|认知决定|格局决定/,
+        // 对比句式：制造“我们 vs 他们”
+        // "不同"太泛："天才的大脑和普通人有什么不同"是科普疑问句
+        /(?:和|与)普通人.{0,6}(?:完全)?(?:不一样|差距|区别)/,
+        /普通人.{0,4}(?:根本|永远)?不知道/,
+        /(?:混得好|过得好的|厉害|牛逼)的人.{0,6}(?:都|从来)/,
+        /越努力越(?:穷|穷困|焦虑|迷茫)/,
+      ],
+      // 两个不同的弱词才拦：单有“思维”可能是认知科学，单有“精英”可能是社会学
+      weak: [
+        /思维/, /认知/, /格局/, /阶层/, /圈层/, /精英/,
+        /普通人与/, /普通人/, /底层/, /富二代/, /有钱人/,
+      ],
+      weakNeed: 3,
+      exempt: [
+        // 真社会学 / 经济学：研究的是结构，不是“我发现”
+        /社会学|经济学|统计学|人类学|人口学|政治学/,
+        /基尼系数|社会流动|社会分层|阶层结构|收入分配|财富分配|贫富差距/,
+        /精英再生产|布迪厄|文化资本|社会资本/,
+        // 学术形态
+        /学术|论文|研究|实证|综述|研讨会|期刊/,
+        // 真认知科学
+        /认知心理学|认知科学|神经科学|工作记忆|认知负荷|认知偏差|认知失调/,
+        // 纪录片 / 课程 / 访谈这类正经形态
+        /纪录片|公开课|讲座|访谈|课程/,
+      ],
+    },
+
+    // ---- 伪科普 / 养生谣言 ----
+    // 这是最危险的一类：它故意用"科学 / 实验 / 研究 / 考古"这些词，
+    // 正好蹭到 KNOWLEDGE 的 −3 保护，于是看起来像知识、实际是垃圾。
+    // 必须先于质量层把它拦下来，否则知识保护就是伪科学的免死金牌。
+    pseudoscience: {
+      label: '伪科普/养生谣言',
+      strong: [
+        // 养生营销模板
+        // 上火："吃荔枝会上火吗"是正常营养科普，带"吗/的/是"时不算
+        /排毒|宿便|湿气重|寒气重|宫寒|气血不足|经络不通|一吃就上火|降火|去火/,
+        /养生秘方|祖传秘方|老中医|中医世家|民间偏方|祖上秘方|家传秘方/,
+        // 杀死癌细胞：CAR-T / 免疫疗法在讲机制，不是养生骗局
+        // "杀死癌细胞"是免疫治疗的标准说法（CAR-T 就是干这个的），
+        // 只有"饿死癌细胞"才是伪科学。所以前者不进强规则。
+        /抗癌食物|防癌食物|致癌食物|饿死癌细胞/,
+        /(每天|经常).{0,6}(喝|吃|做).{0,8}(不得|远离|告别|不求人).{0,6}(癌|病|医院)/,
+        /(医生|专家|医院).{0,6}(不会|不敢|不让|不愿).{0,4}(告诉你|说|公开)/,
+        // 根治是医学标准术语（根治幽门螺杆菌 / 根治性手术），不能裸用
+        /三天见效|七天见效|立竿见影|包治|药到病除/,
+        /(一起|同时)(吃|喝|用).{0,6}(等于|相克|中毒|慢性自杀|要命)/,
+        /按.{0,4}穴位.{0,6}(治好|就能|百病|失眠|减肥)/,
+        /一个.{0,4}(动作|穴位|方子).{0,8}(治好|搞定|解决)/,
+        // 阴谋论叙事：把"被封杀"当成可信度证据
+        /(科学|专家|学术界|主流).{0,6}(封杀|不敢承认|隐瞒|无法解释|解释不了)/,
+        /(被|遭).{0,6}(封杀|屏蔽|删除|禁播).{0,6}(真相|实验|发现|答案)/,
+        /金字塔.{0,8}(外星|非人类|超文明)/,
+        /(史前|远古|上古).{0,6}(文明|核反应堆|飞行器|高科技|超级文明)/,
+        // "考古/历史 + 细思极恐"：把不可证伪的猜测包装成发现。
+        // 中间允许 20 字 —— "考古队挖到一半突然停工，原因细思极恐" 隔了 12 字。
+        // 删掉"真相"："考古发现的真相：二里头是不是夏都"是正经历史讨论
+        /(考古|遗址|文物|古墓|史料|史书).{0,20}(细思极恐|不敢想|无法解释|诡异|谜团|毛骨悚然)/,
+        // 量子 / 能量 / 频率类伪科学商品
+        /量子.{0,6}(能量|波动|保健|挂坠|水|共振|纠缠水)/,
+        /能量水|富氧水|小分子水|碱性水|磁化水|低频水/,
+        /水知道答案|水的记忆|细胞记忆|信息水/,
+      ],
+      weak: [
+        // 量子 / 能量 / 磁场 / 频率 / 振动 / 共振 是物理教科书词汇，
+        // weakNeed=3 在一句"音叉共振实验：频率与振动的关系"里能凑满。
+        // 伪科学商品的特征是搭配（量子+水/挂坠/保健），已在 strong 里。
+        /养生/, /偏方/, /秘方/, /排毒/, /抗衰/, /排毒养颜/,
+      ],
+      weakNeed: 3,
+      exempt: [
+        // 正经医学 / 生物 / 物理
+        /医学|临床|病理|药理|生理学|生物化学|分子生物学|循证/,
+        /物理|化学|量子力学|量子场论|凝聚态|量子计算|量子信息/,
+        /食品科学|营养学|毒理学|食品安全|膳食指南/,
+        // 科学传播 / 打假 —— 这些正是在讨论伪科学本身
+        /辟谣|打假|伪科学|科学精神|科学传播|科普中国|造谣/,
+        // 历史 / 文化研究
+        /医学史|科学史|中医史|医学人类学|科技史|考古学|文献学/,
+      ],
+    },
+
+    // ---- 自律鸡汤 / 学习方法论 ----
+    // 与 mindset 的区别：mindset 卖阶层身份，selfhelp 卖自律努力。
+    // 共同点：都是不可核查的个人叙事，信息量为零。
+    selfhelp: {
+      label: '自律鸡汤',
+      strong: [
+        /自律.{0,8}(一年|半年|\d+\s*天|改变|人生|逆袭|开挂)/,
+        /(改变|改写|重启).{0,2}你的一生|改变人生|人生开挂/,
+        /学霸.{0,6}(方法|笔记|作息|时间表|习惯)/,
+        /效率.{0,6}(翻倍|翻三倍|提升\s*\d+\s*倍)/,
+        /每天(早起|坚持).{0,10}(改变|人生|逆袭|开挂)/,
+        /普通人.{0,4}(逆袭|翻身)的(唯一)?(路径|方法|机会)/,
+        /为什么你(总是|一直).{0,8}(学不进去|做不好|坚持不了|不成功|原地踏步)/,
+        /(逆袭|翻身)之路|人生重建/,
+      ],
+      weak: [
+        /学习法/, /自律/, /效率/, /时间管理/, /早起/, /坚持/, /习惯/, /逆袭/, /鸡汤/,
+      ],
+      weakNeed: 3,
+      exempt: [
+        // 真正的学习科学 / 教育心理学
+        /认知负荷|间隔重复|记忆法|元认知|学习科学|教育心理学/,
+        /心理学|教育学|行为科学|认知科学/,
+        /论文|研究|实验|数据|综述|实证/,
+      ],
+    },
+
+    superstition: {
+      label: '玄学迷信',
+      strong: [
+        // 转运：海淘转运 / 物流转运是另一个意思
+        // 转运：只认玄学语境。海淘物流的"转运公司"不算。
+        /算命|看相|批八字|紫微斗数|生辰八字|改命|转运(?:符|咒|法事|开运|玄学|方法|秘诀)|(?:怎么|如何|怎样)转运/,
+        /风水(?:布局|大师|先生|摆|化解)|看风水|阴宅|阳宅|堪舆/,
+        /开光|符咒|法事|驱邪|招魂|通灵|前世今生/,
+        /招财(?:符|咒|法事|开光|摆件)|旺财|桃花运|化解太岁/,
+        // 塔罗 / 占卜：4.13.0 从 weak 升到 strong。
+        // weak 需要同期命中两个词，但真实标题常常只写一个：
+        // 「【龙女塔罗】和未来对象在一块不用担心的点」—— 200 次抓取实测漏网。
+        // 这两个词本身足够专指，没有歧义。
+        /塔罗|占卜|星盘|解牌|抽牌|排盘|灵摆|扶乩/,
+      ],
+      weak: [/星座/, /运势/, /本命年/, /水逆/, /卦/],
+      weakNeed: 2,
+      exempt: [
+        /天文学|天文|星座图|黄道|岁差|观测/,
+        // 甲骨 / 卜辞：商代占卜是考古与文字学对象，不是玄学内容。
+        // 「甲骨文与商代占卜：汉字起源考」实测被新加的 /占卜/ 咬到。
+        /民俗|民俗学|人类学|宗教史|文化史|神话学|古建筑|建筑史|考古|选址|甲骨|卜辞|简帛|青铜|先秦|商周/,
+        /统计学|概率|幸存者偏差|心理暗示|巴纳姆效应/,
+        /历史|考据|文献/,
+      ],
+    },
+
+    gambling: {
+      label: '赌博博彩',
+      strong: [
+        /赌球|赌场|网赌|赌博|博彩|六合彩|百家乐|老虎机|轮盘/,
+        /彩票|双色球|大乐透|竞猜|盘口/,
+      ],
+      weak: [/押注/, /庄家/, /赔率/, /下注/, /开奖/],
+      weakNeed: 2,
+      exempt: [
+        /概率论|博弈论|数学|统计学|期望值|随机/,
+        /反赌|戒赌|赌博危害|成瘾|心理干预/,
+        /模拟器|游戏|桌游|棋牌/,
+        /金融|衍生品|期权|期货/,
+      ],
+    },
+
+    binge: {
+      label: '吃播暴食',
+      strong: [
+        /大胃王|吃播|暴食|催吐/,
+        /一口气吃|一次吃\d+|挑战吃\d+|\d+斤.*吃完/,
+        // 生吃蔬菜是营养话题，只认猎奇对象
+        /生吃(?:活物|章鱼|海鲜|昆虫|蛇|老鼠)|生吞|活吃/,
+      ],
+      weak: [/吃到饱/, /无限量/, /管够/, /狂吃/],
+      weakNeed: 2,
+      exempt: [
+        /美食制作|烹饪|做法|食谱|教程|厨艺|探店/,
+        /营养学|食品安全|食品科学|热量|膳食/,
+        /挑战赛|比赛|竞技/,
+      ],
+    },
+
+    // ---- 游戏：用户要的是知识（物理/文学/艺术），不是游戏讲解 ----
+    // 覆盖两类：直接点名游戏（炉石 / 星穹铁道 / 影之刃零 …），
+    //           或不通报名号但通篇是玩法黑话（卡组 / 上分 / 兑换码 / 抽卡 …）。
+    // 只搜过一次某个游戏，推荐流就会被同类内容灌满 —— 这是兴趣画像的惯性，
+    // 脚本没法让 B 站多推知识，但可以保证推送里出现的游戏内容不占版面。
+    // ---- 奥特曼 ----
+    // 特摄剧 / 玩具卡片开箱 / 角色解说。
+    //
+    // 判据是明确 IP 名，不是「特摄」这个概念本身：
+    // 「假面骑士与超级战队的差异」「圆谷英二与特摄技术的起源」
+    // 是正经的影视史内容，不该被这一类吃掉。
+    //
+    // 角色名只收几乎只见于该系列的：迪迦 / 赛罗 / 泽塔 / 特利迦 / 德凯 /
+    // 布莱泽 / 欧布 / 捷德 / 泰迦 / 梦比优斯 / 奈克瑟斯 / 维克特利 ...
+    // 刻意**不收**：高斯（数学家 / 高斯模糊）、银河（银河系）、
+    // 诺亚（诺亚方舟）、贝利亚（所罗门魔神）、杰克（常见英文名）、
+    // 艾斯（扑克牌 ACE）、雷欧（人名）—— 这些单独出现时歧义太大。
+    ultraman: {
+      label: '奥特曼',
+      strong: [
+        // 主 IP 名 + 各地译名
+        /奥特曼|ultraman|超人力霸王|咸蛋超人/i,
+        // 高专指角色名：「迪迦 25 周年」「泽塔最终形态」这类不写「奥特曼」的标题。
+        //
+        // 泽塔要排除数学语境：Zeta（ζ）函数是数论 / 复分析的标准对象，
+        // 中文常译作「泽塔函数」。实测「泽塔函数在数论中的应用」曾被误拦。
+        /迪迦|赛罗|泽塔(?!.{0,6}(?:函数|分布|黎曼|ζ|数论|猜想|复分析|zeta))|特利迦|德凯|布莱泽|欧布|捷德|泰迦|梦比优斯|奈克瑟斯|维克特利|格丽乔|亚刻|爱迪奥特曼|尤莉安/,
+      ],
+      // 用户要的是整类不看，不设 exempt。
+      exempt: [],
+    },
+
+    gaming: {
+      label: '游戏内容',
+      strong: [
+        // ---- 卡牌 / CCG ----
+        /炉石|Hearthstone|酒馆战棋|佣兵战纪/i,
+        // ---- 二次元手游 ----
+        /星穹铁道|崩坏3|崩坏三|绝区零|原神|鸣潮|明日方舟|碧蓝航线|少女前线|战双|重返未来|Fate.?.Grand.?.Order|FGO/i,
+        // ---- 竞技 / 射击 ----
+        /王者荣耀|英雄联盟|League of Legends|无畏契约|瓦罗兰特|Valorant|暗区突围|暗区端游|暗区手游|和平精英|绝地求生|PUBG|穿越火线|守望先锋|Overwatch|Apex英雄|Apex Legends|彩虹六号|永劫无间|三角洲行动|反恐精英|CSGO/i,
+        // ---- MMORPG / 国风网游 ----
+        /剑网3|剑网三|逆水寒|天涯明月刀|梦幻西游|大话西游|地下城与勇士|DNF/i,
+        // ---- 单机 / 主机 ----
+        /影之刃零|黑神话|艾尔登法环|只狼|塞尔达|宝可梦|Pokemon|怪物猎人|魔兽世界|最终幻想|命运2|上古卷轴|模拟人生|星露谷|泰拉瑞亚|空洞骑士|哈迪斯|杀戮尖塔|帝国时代|红色警戒|星际争霸/i,
+        // ---- 沙盒：MC 只在带载体词时才算，裸写 MC 可能是主持人 ----
+        /我的世界|Minecraft|MC.{0,8}(模组|地图|地牢|整合包|服务器|材质包)/i,
+        // ---- 游戏专属资源 / 机制词：不玩这个游戏不会这么说话 ----
+        /星琼|纠缠之缘|创世结晶|摩拉/,
+        /抽卡|卡池|十连|保底出|满命|满精|精五|毕业装/,
+        // 天梯 / 上分 / 上段 在其他领域也常用（华山天梯、体育上分），只进 weak
+        /卡组|掉分|连跪|开黑|副本攻略|无伤通关/,
+        /版本前瞻|测试服|体验服|内测服|游戏.{0,4}公测|战令|首充/,
+        /游戏实况|游戏解说|游戏攻略|全流程攻略|全收集|白金奖杯/,
+      ],
+      // 两个不同弱词同时出现才判定：单有"攻略"可能是旅游，单有"赛季"可能是体育。
+      //
+      // 两条硬约束（都实际踩过）：
+      // 1. weak 必须一词一正则，写成 /a|b|c/ 只算 1 个命中。
+      // 2. 同一个词不能出现两次 —— "天梯"写在两条里，
+      //    「华山长空栈道天梯」就会算 2 个命中，直接越过 weakNeed。
+      //    这条与第 1 条方向相反，同样危险。
+      //
+      // 天梯 / 上分 / 上段 / 赛季 / 段位 / 新赛季 / 公测 全部删掉：
+      // 它们在体育（中超新赛季）、软件（系统公测）、地理（华山天梯）、
+      // IT（云主机）里都是常用词，不能当游戏证据。
+      weak: [
+        /游戏/, /手游/, /端游/, /单机/, /联机/, /网游/, /电竞/, /游戏主机/,
+        /游戏攻略/, /实况/, /游戏通关/, /副本/, /存档/, /模组/, /整合包/,
+        /卡组/, /抽卡/, /卡池/, /开黑/, /连跪/,
+      ],
+      weakNeed: 2,
+      exempt: [
+        // 在讨论"游戏作为一种文化 / 技术 / 产业"，而不是在玩：这是知识内容
+        /游戏设计|游戏史|游戏产业|游戏研究|电子游戏研究|游戏人类学|游戏社会学/,
+        /游戏引擎|游戏开发|游戏编程|游戏美术|游戏配乐|游戏音乐|关卡设计|游戏叙事|世界观设计/,
+        /Unity|Unreal|虚幻引擎|Shader|渲染管线/,
+        // 学术形态
+        /论文|学术|研讨会|期刊|研究综述/,
+        // 影视内容里顺带提到游戏（"玩《影之刃零》，看《叶问》"这类功夫片拆解）
+        /影评|剧评|拉片|镜头语言|电影分析|功夫电影/,
+      ],
+    },
+
+    // ---- 生活方式：穿搭 / 减肥 / 医美 / 装修 / 独居 ----
+    // 不是"壤"，只是与知识无关。用户明确说只要知识，那这类就占着位置。
+    // exempt 必须兜住相关的正经内容：服装史、营养学、建筑学。
+    lifestyle: {
+      label: '生活方式',
+      strong: [
+        // 穿搭 / 美妆
+        /穿搭|显白|显瘦|显高|梨形身材|苹果型身材|气质提升/,
+        /化妆教程|修容|底妆|眼妆|口红色号|仿妆|换头术/,
+        // 减肥 / 医美
+        /一个月瘦\d+|瘦\d+斤|减脂期|代餐|暴汗|燃脂/,
+        /易胖体质|易瘦体质|喝水都胖|喝水就胖|躺瘦/,
+        // 探店 / 打卡（区别于烹饪教程：教程是技能，探底是消费记录）
+        /探店|这家店.{0,6}(值不值|怎么样|排队)|排队.{0,4}(小时|分钟).{0,6}(值不值|吃到)/,
+        /网红店|苍蝇馆子|街[边头]小吃.{0,4}(探访|合集|测评|攻略)?/,
+        /复刻.{0,8}(米其林|招牌菜|店里的|网红)/,
+        /医美|水光针|热玛吉|玻尿酸|割双眼皮|提拉紧致/,
+        // 装修 / 家居
+        /装修.{0,6}(坑|避坑|踩雷|血泪)|小户型|软装|硬装|收纳技巧/,
+        // 生活方式叙事
+        /独居第.{0,4}年|极简生活|低欲望|断舍离|躺平主义/,
+      ],
+      weak: [
+        /穿搭/, /显瘦/, /减肥/, /减脂/, /瘦身/, /医美/, /装修/,
+        /收纳/, /独居/, /极简/, /家居/, /软装/, /护肤/,
+      ],
+      weakNeed: 3,
+      exempt: [
+        // 服装 / 纺织 / 设计史
+        /服装史|服饰史|纺织|服装设计|服装工艺|剪裁|版型设计/,
+        // 营养 / 代谢 / 运动生理
+        /营养学|代谢|能量消耗|运动生理|内分泌|肥胖症|体成分/,
+        // 建筑 / 室内设计
+        /建筑学|建筑史|古建筑|文物保护|室内设计史|人体工程学/,
+        /心理学|社会学|消费文化|亚文化研究/,
+        // 烹饪技术 / 食品科学："复刻"类标题里带了这些就是真教程
+        /烹饪|食谱|做法|厨艺|食品科学|美拉德反应|发酵/,
+      ],
+    },
+
+    // ---- 育儿鸡汤 ----
+    parenting: {
+      label: '育儿鸡汤',
+      strong: [
+        /聪明妈妈|聪明家长|宝妈必看|育儿经验|带娃日常|育儿心得/,
+        /孩子(发脾气|哭闹|不听话|叛逆|撒谎).{0,8}(怎么办|这样做|妈妈)/,
+        /(要不要|该不该)给孩子|孩子该不该/,
+        /婆婆.{0,8}(带娃|帮忙|闹翻|矛盾)/,
+        /补习班|兴趣班|鸡娃|卷教育|学区房(?!.{0,8}(?:政策|划片|房价|改革))/,
+      ],
+      weak: [/育儿/, /带娃/, /孩子/, /宝宝/, /妈妈/, /亲子/, /早教/, /辅导/],
+      weakNeed: 3,
+      exempt: [
+        // 发展心理学 / 教育学
+        /发展心理学|儿童心理学|教育学|教育研究|认知发展|依恋理论/,
+        /论文|研究|综述|实证|统计/,
+        /儿科|儿童保健|医学/,
+      ],
+    },
+
+    // ---- 职场叙事 ----
+    career: {
+      label: '职场叙事',
+      strong: [
+        // 辞职后：社保/公积金这类办事指南是实用信息，不是叙事
+        /裸辞|被裁员|失业第|裁员潮|毕业即失业|辞职后(?!.{0,8}(?:社保|公积金|医保|档案|断缴))/,
+        /(大厂|国企|体制内).{0,4}(打工|工作|真实生活|生存)/,
+        /35\s*岁.{0,6}(危机|被裁|失业|求职)/,
+        /(大厂|互联网).{0,4}(离职|下岗)/,
+        /职场.{0,6}(真相|潜规则|生存法则|厚黑)/,
+        // 招聘歧视 / 用人偏好："为什么很多外贸要求只招女生"这类。
+        // 这类没有可核查的答案，实际内容是主观猜测与擦边，信息量为零。
+        // 注意限定了"招/收/要求"这类动作，不会咬到"招财猫"之类。
+        /(?:只招|只要|不招|只收|都要求|都招|偏爱|不收).{0,8}(?:女生|男生|女性|男性|年轻人|35\s*岁|应届|已婚|未婚|本地人)/,
+        /(?:公司|企业|老板|HR|人事|招聘|用人单位).{0,10}(?:不要|不招|歧视|只要|偏爱)/,
+        /(?:外贸|工厂|奶茶店|前台|服务员|销售|客服|银行|空乘|护士|幼师|文员|行政|餐厅|店铺).{0,8}(?:只招|只要|都招|偏爱|不收)/,
+        // 职场内卷叙事："为什么很多公司都在裁员"
+        /(?:工作|岗位|就业|公司|企业|行业|工厂|餐厅|店铺).{0,10}(?:越来越难找|都在裁员|不招人|不愿意做|不好做|干不下去)/,
+      ],
+      weak: [/职场/, /打工/, /裁员/, /裸辞/, /求职/, /面试/, /工位/, /加班/],
+      weakNeed: 3,
+      exempt: [
+        // 劳动经济学 / 就业研究
+        /劳动经济学|就业研究|劳动力市场|失业率|职业发展研究/,
+        /社会学|经济学|统计学|论文|研究|报告/,
+        /劳动法|劳动合同|就业政策|社保制度/,
+      ],
+    },
+
+    // ---- 升学导师：张雪峰这类「导师观点输出」----
+    // 「普通家庭千万别报这些专业」「把就业真相说透了」。
+    // 卖的是一个人的判断，不是可核查的信息。
+    // 名字写在标题里就是最强指纹，不需要再看时长和文案分数。
+    tutor: {
+      label: '升学导师',
+      strong: [
+        /张雪峰|雪峰老师|峰学蔚来/,
+      ],
+      // 用户要的是整类不看，不设 exempt。
+      exempt: [],
+    },
+
+    // ---- 清史内容 ----
+    // 用户明确不看这段历史的内容，判的是题材，不是质量：
+    // 一条拍得很好的清史纪录片同样不要。
+    //
+    // 「大清」必须带边界：大清早 / 大清仓 / 大清扫 是日常说法。
+    // ---- 锐评排名：给历史人物 / 明星按主观标准排序 ----
+    // 「从夯到拉锐评民国十大美男」「三国十大名将排名」这类。
+    // 卖的是「谁第一」的悬念和评判者的口吻，本身没有可核查的信息。
+    //
+    // 与 mindset 的区别：mindset 卖阶层身份，这一类卖名次。题材不同。
+    // 与 career 的「排行榜」也不冲突 —— 那是招聘 / 就业场景。
+    //
+    // 关键约束：只认**人物**排名。「世界大学排名」「GDP 排名」
+    // 「车企市值排名」是数据内容，必须有 exempt 兜住，否则成片误杀。
+    rankBait: {
+      label: '锐评排名',
+      strong: [
+        // 从夯到拉 / 从高到低 / 从美到丑：排序句式，这类标题最硬的指纹
+        /(?:从|由)(?:夯|拉|高|低|强|弱|好|差|美|丑|帅|神|坑|顶|底)(?:到|至)(?:夯|拉|高|低|强|弱|好|差|美|丑|帅|神|坑|顶|底)/,
+        // 锐评 / 吐槽 + 排名词。两个都要有：
+        // 单有「锐评」可能是影评、时事评论，单有「排名」可能是数据榜单。
+        /(?=[^。]*(?:锐评|吐槽|辣评|毒舌|评级|打分|评分))(?=[^。]*(?:排名|排行|榜单|榜一|第[一二三四五六七八九十\d]+名|谁排第一|谁是第一|实至名归))[^。]*(?:排名|排行|榜单|榜一|第[一二三四五六七八九十\d]+名|谁排第一|谁是第一|实至名归)/,
+        // 数词 + 人物类别：十大美男 / 四大美女 / 十大名将
+        /(?:十大|十佳|十位|十强|二十大|五大|四大|八大|六大|三大|百大|最强)\s*(?:美男|美女|帅哥|俊男|女神|男神|皇帝|名将|名臣|奸臣|才子|美人|帝王|君主|武将|谋士|文人)/,
+        // 十大 + 榜单词
+        /(?:十大|二十大|百大|最强).{0,6}(?:排名|排行|榜单|排行榜)/,
+        // 人物 + 榜单词：三国武将排名 / 古代美男排行榜
+        /(?:名人|美男|美女|帅哥|俊男|女神|男神|武将|名将|皇帝|帝王|君主|才子|美人|明星|演员|歌手).{0,10}(?:排行榜|排名|排行|榜单|榜)/,
+      ],
+      exempt: [
+        // 数据 / 经济 / 学术榜单：这些是可核查的排名，不是主观评判
+        /GDP|营收|市值|福布斯|世界500强|财富榜|富豪榜/,
+        /大学排名|高校排名|学科评估|QS|泰晤士|软科|双一流/,
+        /论文|引用|影响因子|H指数|就业率|薪资|人口|经济体/,
+        // 学术讨论：研究排行榜本身，而不是生产排行榜
+        /社会学|统计学|传播学|经济学|人类学|研究方法|指标体系/,
+        /论文|研究|报告|综述|实证|数据分析|样本/,
+        // 作品榜：豆瓣电影 / 音乐榜单，属于内容索引
+        /豆瓣|IMDb|票房|音乐榜|歌曲榜|专辑|播放量/,
+      ],
+    },
+
+    qing: {
+      label: '清史内容',
+      strong: [
+        // 朝代名
+        /清朝|清代|清史|清廷|清宫|满清|晚清|清末/,
+        /大清(?!早|仓|扫|量|门|衣|学|真|理|点|零|家|街|院)/,
+        // 年号与皇帝
+        /康熙|雍正|乾隆|嘉庆|道光|咸丰|同治|光绪|宣统|顺治|皇太极|努尔哈赤/,
+        // 人物
+        /慈禧|李鸿章|曾国藩|左宗棠|张之洞|和珅|纪晓岚|鳌拜|多尔衮|年羹尧|林则徐/,
+        // 制度与事件
+        /八旗|鸦片战争|太平天国|义和团|戊戌变法|洋务运动|甲午战争|甲午海战|辛丑条约|马关条约/,
+      ],
+      // 只留「讲物」的内容：器物 / 工艺 / 建筑 / 书画。
+      // 「清代家具的榫卯结构」「康熙青花瓷的分期」是物质文化研究，
+      // 不是「讲清朝故事」，留着。讲史实的学术内容不豁免 ——
+      // 用户要的是整段历史不看，不是只要学术版。
+      exempt: [
+        /(?:清朝|清代|大清|康熙|雍正|乾隆|嘉庆|道光|咸丰|同治|光绪).{0,8}(?:家具|瓷器|陶瓷|青花|粉彩|珐琅|玉器|漆器|织绣|服饰|建筑|园林|书画|绘画|书法|版画|雕刻|工艺|器物|钱币|铜器|银元|元宝|铜钱|玻璃|纹样|窗|款识|官窑|民窑)/,
+        // 同名词不是清史：康熙来了（综艺）/ 康熙字典（文字学）/ 乾隆白菜（菜谱，
+        // 鲁菜里真有这道）/ 李鸿章杂烩（徽菜）/ 清宫手术（妇科，不是清宫）。
+        // 这几条都是两字词裸奔的经典坑，不拦会变成实打实的误杀。
+        /康熙来了|康熙字典/,
+        /乾隆白菜/,
+        /李鸿章(?:大)?杂烩/,
+        /清宫(?:手术|术|后|不干净)|刮宫/,
+        // 清宫剧的幕后：服装 / 造型 / 美术 / 道具是影视制作内容，不是讲史
+        /(?:清宫剧|清宫戏|清朝剧).{0,10}(?:服装|造型|服饰|美术|道具|化妆|考据|幕后|拍摄|制作)/,
+      ],
+    },
+
+    // ---- 商业大佬 / 商业帝国叙事（4.35.0）----
+    // 用户点名清掉的一批：企业家个人 IP、家族企业、暴雷地产。
+    //
+    // 判据只用**专名**，不用「首富 / 企业家 / 白手起家 / 商业帝国」这类泛词。
+    // 泛词会把正经商业新闻和经济学内容一网打尽，而专名没有歧义 ——
+    // 这也是整张表的设计取向：宁可漏一点，不把正常内容大词一网打尽。
+    tycoon: {
+      label: '商业大佬叙事',
+      strong: [
+        // 马云：B 站有同名 UP「马云飞」，另有马云鹏 / 马云龙 / 马云峰
+        // 等同前缀人名。只排除这几种后缀，「马云说」「马云演讲」照常命中。
+        /马云(?!飞|鹏|龙|峰)/,
+        /刘强东/,
+        /王健林/,
+        // 娃哈哈：中文里同时是笑声（「娃哈哈，笑死我了」），裸词必误伤。
+        // 判据是「后面不接标点 / 叠字 / 结尾」——
+        // 只有后面还跟着实词时，它才是在说这家公司。
+        //   命中：「娃哈哈集团」「娃哈哈为什么卖不动」「宗馥莉接班娃哈哈」
+        //   不命中：「娃哈哈，笑死我了」「哈哈哈哈娃哈哈」「标题就写个娃哈哈」
+        /娃哈哈(?![\s，,。、；;：:!！?？~～—…哈]|$)/,
+        // 品牌方的人名，无歧义（宗馥丽是常见错写，一并收）。
+        /宗庆后|宗馥莉|宗馥丽/,
+        // 娃哈哈的旗舰单品，名字本身就是品牌代称。
+        // 只收这一个：AD 钙奶 是泛品类（多家都做），收了会误伤饮料测评。
+        /营养快线/,
+        // 恒大：楼盘、球队、债务都算。
+        // 「永恒大爱」「守恒大」里的「恒大」是跨词，用 lookbehind 排除。
+        /(?<![永守])恒大/,
+        /许家印/,
+      ],
+      // 不设 exempt：用户要的是这批专名一个不看，
+      // 「从恒大看房地产泡沫」这种学术化复述同样属于他明确不要的内容。
+    },
+
+    // ---- 外国政要（4.38.0）----
+    // 用户 2026-11-06 追加：「什么奥巴马，特朗普，还有这些类似的东西的，都杀掉」——
+    // 样本是「奥巴马亚特兰大超燃演讲：团结起来，重铸美利坚荣光」（UP：白宫日记）。
+    // 判的是**人物**，不是内容质量。
+    //
+    // 这类词的坑集中在三类，每条排除都对应一个真实同名物：
+    //   川普话   = 四川普通话（不是特朗普）
+    //   林肯公园 = 乐队（Linkin Park）
+    //   华盛顿州 / 华盛顿大学 / 华盛顿邮报 = 地名与机构
+    //   这里根本 = 「这」+「里根」+「本」的跨词
+    //   默克尔细胞 = 医学名词（Merkel cell）
+    // 每条排除都写进正则内部，不靠 exempt ——
+    // matchTopic 里 author 命中先于 exempt，靠 exempt 兜底会漏。
+    foreignPol: {
+      label: '外国政要',
+      strong: [
+        // ---- 美国 ----
+        /奥巴马|欧巴马/,
+        // 川普：只有「川普话」是跨词（四川普通话）
+        /特朗普|川普(?!话)/,
+        /拜登/,
+        // 林肯：林肯公园是乐队，林肯大陆 / 领航员 / 冒险家 / 航海家 / 飞行家是车型
+        /林肯(?!公园|汽车|大陆|领航员|冒险家|航海家|飞行家)/,
+        // 华盛顿：州 / 大学 / 邮报 / 广场 都是地名与机构
+        /华盛顿(?!州|大学|邮报|广场|湖|桥|特区|地铁|机场)/,
+        // 里根：避开「这里根本」「那里根据」这类跨词
+        /(?<![这那哪])里根(?![根本据])/,
+        /肯尼迪(?!病|症)/,
+        /尼克松|罗斯福|布什|克林顿|希拉里|佩洛西|布林肯|蓬佩奥|哈里斯/,
+        // ---- 俄乌 ----
+        /普京|梅德韦杰夫|泽连斯基|泽伦斯基/,
+        // ---- 欧洲 ----
+        /马克龙|默克尔(?!细胞)|朔尔茨|苏纳克|斯塔默|撒切尔|丘吉尔|戴高乐(?!机场|号|航母)|特蕾莎梅|约翰逊(?:首相|政府)/,
+        // ---- 亚洲 / 中东 / 其他 ----
+        /安倍晋三|岸田文雄|石破茂|尹锡悦|金正恩|内塔尼亚胡|埃尔多安|莫迪(?!里阿尼)|卢拉|米莱|特鲁多/,
+      ],
+      // 账号维度：账号名直接是总统府 / 首相府 / 议会所在地的，
+      // 基本就是外国政要内容的搬运号（用户样本的 UP 叫「白宫日记」）。
+      //
+      // 标题完全不含人名时（「今天的白宫简报」「总统今日行程」），
+      // 只靠标题规则会漏。
+      //
+      // 排除建筑 / 旅游 / 历史类账号：「白宫建筑史」「克里姆林宫旅游攻略」
+      // 是正经内容，不能整号杀掉。注意 author 命中先于 exempt，
+      // 所以排除必须写在正则内部。
+      author: [
+        /^(?!.*(?:建筑|历史|旅游|游记|旅行|装修|修缮|游记)).*(?:白宫|克里姆林宫|唐宁街|青瓦台|国会山|海湖庄园|五角大楼)/,
+      ],
+      // 不设 exempt：用户要的是这批人物一个不看。
+      // 「从特朗普看美国民碎」这种学术化复述同样属于不要的内容。
+    },
+
+    // ---- COS 角色扮演（4.37.0）----
+    // 用户 2026-11-06 追加：cos 类内容一律不看。
+    //
+    // 「cos」是整个词表里误伤面最大的一个：它同时是
+    //   余弦函数（cos30°、cos(π/2)、cos 函数、三角函数 sin cos tan）
+    //   英文单词前缀（cost / costume / cosmetic / cosme）
+    //   服装品牌（COS）
+    // 所以分两条：带 play/er 的整词直接命中，裸 cos 走严格排除。
+    cosplay: {
+      label: 'COS 角色扮演',
+      strong: [
+        // cosplay / coser / cosply 的常见错写。
+        // 单独列一条是为了不受下面的排除影响 ——
+        // 「cosplay2024」若走排除规则，末尾的数字会被当成数学记号而放过。
+        /cosplay|coser|cosply/i,
+        // 裸 cos：后面不能跟数学记号，也不能跟「函数 / 值 / 度」这类词。
+        //   命中：「叮当猫COS事件」「漫展 cos 出片」「cos 服制作」
+        //   不命中：「cos30° 等于多少」「cos(π/2)」「cos 函数图像」「cost 成本拆解」
+        //
+        // 注意 `\s*` 必须在两个分支的**公共外层**：
+        // 写成 `(?!\s*(?:函数|...)|\(|...)` 时，`\s*` 只属于第一个分支，
+        // 「cos tan」会因为紧跟的是空格（不在字靦集里）而被误判为命中。
+        /(?<![a-z])cos(?!\s*(?:(?:函数|值|度|求|等于|多少|定理|图像|公式)|[\(\)\[\]a-z\dθαβπ°²³^_+\-*\/=]))/i,
+      ],
+      // 数学语境整类跳过。
+      // 「cos 和 sin 的区别」只靠字符排除拦不住 —— 中文「和」不在数学记号里。
+      // 代价：「cos 三角函数拟人图」也会被放行，但那种标题几乎不存在。
+      exempt: [
+        /三角函数|正弦|余弦|弧度制|求导|定积分|不定积分|坐标系|数形结合/,
+        /\bsin\b|\btan\b|\bcot\b/i,
+      ],
+    },
+
+    // ---- 主播 / 直播（4.37.0）----
+    // 只收「主播」这个词。不收裸的「直播」—— 阅兵直播、球赛直播、
+    // 发布会直播都是正经内容，标题里出现「直播」不等于主播内容。
+    // 首页的直播**卡片**另由 hideLive 处理，与这里无关。
+    streamer: {
+      label: '主播 / 直播',
+      strong: [
+        // 「主播」本身够专指，不会被普通职业内容咬到。
+        // 女主播 / 男主播 / 游戏主播 / 带货主播 / 主播八卦 都含这两个字。
+        /主播/,
+        // 打赏体系的黑话，不带「主播」二字也专指直播圈
+        /榜一大哥|打赏榜|刷礼物/,
+      ],
+      // 不设 exempt。
+      //
+      // 刻意**不收**「舰长 / 提督 / 上舰」：这几个在碧蓝航线、崩坏3
+      // 里是玩家称呼，在清史里「提督」是军衔，收了会大面积误伤。
+      // 也刻意不收裸的「直播」：阅兵直播、球赛直播、发布会直播都是正经内容。
+      exempt: [],
+    },
+
+    // ---- 厚黑权术（4.40.0）----
+    // 用户 2026-11-06 追加：「这种什么厚黑学，为人处世，教你怎样的垃圾内容，
+    // 都杀掉」——样本是「有人拿你立威，必须当场摁住！记住这4招~」（UP：馨晴家）。
+    //
+    // 样本标题里一个「职场」字都没有，所以 career 那条
+    // /职场.{0,6}(真相|潜规则|生存法则|厚黑)/ 完全抓不到。
+    // 这类内容的真正指纹是**句式**，不是话题词：
+    //   敌意假设（有人拿你立威）→ 必须如何（当场摁住）→ 招式计数（这4招）
+    //
+    // 陷阱：
+    //   「拿捏」在北方方言里是「拿捏分寸」，是正面词
+    //   「教你如何」单独出现不能拦 —— 否则所有教程全死
+    //   「立威」可能在正经管理学里出现（新官上任如何立威）
+    // 所以全部走组合：光有招式计数不行，光有人物词也不行。
+    manipulation: {
+      label: '厚黑权术',
+      strong: [
+        // ---- 一、专名，本身无歧义 ----
+        /厚黑学|厚黑术|厚黑|为人处世|为人处事|人情世故|处世之道|处世哲学|处世智慧/,
+        /权谋|权术|驭人术|御人术|制人术|御下术|拿捏人性|掌控人心|操纵人心|人性操控/,
+        /(?:职场|官场|商场|社交|饭局).{0,4}(?:厚黑|权谋|权术|潜规则|算计|博弈术)/,
+        // 「小人」类：“如何对付小人”“防小人的N个手段”
+        /(?:对付|防|整治|收拾|反击|拿捏).{0,4}(?:小人|绿茶|心机婊|杠精|小人精)/,
+
+        // ---- 二、敌意假设 + 对抗动作 ----
+        // 样本走的就是这条：「有人拿你立威，必须当场摁住」。
+        // 前半段是「别人对你做了什么」，后半段是「你要立刻反制」。
+        // 两条必须同时成立 —— 只有前半段可能是在讲校园霸凌求助，
+        // 只有后半段可能是在讲体育对抗。
+        /(?=[^。]*(?:拿你立威|打压你|欺负你|看扁你|踩你|使绊子|算计你|针对你|拿捏你|给你难堪|当众驳你|当众羞辱|让你背锅|甩锅给你|抢你功劳|穿小鞋|下马威|给你立规矩))(?=[^。]*(?:你必须|你一定要|你就必须|你就这样|当场|立刻|马上|反击|反制|摁住|压回去|怼回去|镇住|拿回来|回击|立规矩))[^。]*(?:你必须|你一定要|你就必须|你就这样|当场|立刻|马上|反击|反制|摁住|压回去|怼回去|镇住|拿回来|回击|立规矩)/,
+
+        // ---- 三、招式计数 + 人际控制语境 ----
+        // 单独「记住这4招」可能是健身教程；单独「拿捏」可能是方言。
+        // 但「拿捏 + 记住这N招」同时出现，就是权术营销。
+        /(?=[^。]*(?:拿捏|立威|镇住|压住|摁住|驭人|御下|掌控|收服|降服|反制|博弈|心机|情商话术))(?=[^。]*(?:记住这\s*\d+\s*招|\d+\s*(?:个)?(?:招|术|手段|套路|话术|技巧)|教你(?:怎么|如何|怎样)))[^。]*(?:\d+\s*(?:个)?(?:招|术|手段|套路|话术|技巧)|教你(?:怎么|如何|怎样))/,
+
+        // ---- 四、「教你做人 / 教你上桌」句式的权术化写法 ----
+        // 「学会这套，你就没人敢欺负」「看懂这些，你就是高手」
+        /(?:学会|掌握|看懂|记住|背下).{0,8}(?:没人敢|没人能|谁都|再也没人).{0,6}(?:欺负|拿捏|小看你|轻视你|惹你)/,
+        /(?:城府|心机|手段|话术).{0,6}(?:要深|要狠|要硬|要重|升级|拉满)/,
+        // 「做人要有点城府」「混社会必须有手段」—— 城府/心机作名词受褒扬
+        /(?:做人|为人|混社会|混职场|出来混).{0,10}(?:城府|心机|手段|脾气|狼性)/,
+        // 「没人告诉你的 N 条规矩 / 潜规则」—— 这套句式的卖点就是信息垄断
+        /没人(?:会)?告诉你的?.{0,8}(?:规矩|潜规则|道理|真相|人情世故|处世)/,
+        /(?:社交场|饭局|酒桌|职场上?).{0,8}(?:规矩|潜规则|座位|排位|顺序|敬酒)/,
+        // 「看懂这些，你就是职场高手」：只认带领域的四个组合。
+        // 裸「高手」不放（「羽毛球高手」「摄影高手」是正经内容）。
+        /(?:学会|掌握|看懂|记住|背下|搞懂).{0,10}(?:你就是|你就成了|你也能成为|早晚是).{0,6}(?:职场高手|社交高手|情场高手|处世高手|人生赢家|人上人)/,
+      ],
+      // 不设 exempt。
+      //
+      // 判据已经排掉了容易误伤的内容：
+      //   「拿捏分寸」「拿捏得恰到好处」—— 无招式计数、无敌意假设
+      //   「教你如何做红烧肉」「教你如何学英语」—— 无人际控制词
+      //   「新官上任如何立威」—— 无「有人对你做」的敌意假设
+      exempt: [],
+    },
+
+    // ---- 原生家庭（4.39.0）----
+    // 用户 2026-11-06 追加：「这种什么原生家庭的破玩意也都杀掉」——
+    // 样本是「永远都不要同情你的母亲！」（UP：通鉴新语）。
+    //
+    // 注意样本标题里**没有「原生家庭」四个字**。只写这个词会漏掉一大片：
+    // 「不要同情你的母亲」「逃离我的父母」「东亚父母的爱让人窒息」都不带它。
+    //
+    // 但反过来，「母亲 / 父亲」单独出现又太泛：
+    //   母亲节、父亲节、母亲河（黄河）、慈母手中线、孟母三迁、岳母刺字
+    // 而且「父母爱情」是电视剧名。所以判据一律是**组合**：
+    // 人物词 + 一个明确的指控 / 脱离动作，缺一不可。
+    // 单独提「妈妈做的菜」不会命中。
+    //
+    // 与 parenting 的分工：
+    //   parenting = 父母视角讲怎么养孩子（鸡娃、兴趣班、孩子发脾气）
+    //   family    = 成年子女视角控诉父母（伤害、断亲、窒息）
+    // 两者视角相反，不重叠。
+    family: {
+      label: '原生家庭',
+      strong: [
+        // 专名，无歧义
+        /原生家庭/,
+        // 这一题材的固定话题名，本身就是标题指纹
+        /情感勒索|控制型父母|有毒的父母|扫兴父母|愧疚式教育|情感忽视|代际创伤/,
+        /父母皆祸害|东亚(?:式)?父母|中国式父母|扫兴(?:型)?父母/,
+        // 人物词 + 控诉动作。「毁了我」「害了我」这种必须是真的指控，
+        // 不能只写「父母」就拦
+        /(?:父母|母亲|父亲|爸妈|我妈|我爸|爹妈|老娘|老妈|老爸).{0,12}(?:毁了我|害了我|毁掉我|坑了我|拖累|消耗我|道德绑架|情感绑架|重男轻女)/,
+        // 重男轻女单独收：它是这个话题的核心母题，且完全无歧义。
+        // 不靠「人物词 + 重男轻女」的组合 —— 实际标题常常把词放在前面
+        //（「重男轻女的家庭里，女儿是怎么长大的」），人物词一个都没有。
+        /重男轻女/,
+        // 「我妈…她不爱我」这类远距控诉：主语到谓词可能隔十几个字
+        //（「我妈说这句话的时候，我就知道她不爱我」隔了 14 字）。
+        // 限定主语必须是家庭人物词 —— 否的话「他不爱我了」这类失恋内容会被误伤。
+        /(?:父母|我妈|我爸|爹妈|老爸|老妈).{0,24}(?:不爱我|没爱过我|从来没爱|不曾爱过)/,
+        // 「我的父母是巨婴」「父母是 NPD」：标签在人物词之后
+        /(?:父母|母亲|父亲|我妈|我爸).{0,8}(?:是巨婴|是\s*npd|自恋型|吸血鬼)/i,
+        // 「父母的爱是有条件的」这类定性句
+        /(?:父母|母亲|父亲)的爱.{0,8}(?:有条件|是交易|让我窒息|要还的)/,
+        /(?:父母|母亲|父亲|我妈|我爸|爹妈).{0,8}(?:让我窒息|很窒息|太窒息|控制狂|偏心眼)/,
+        // 脱离 / 断亲类：必须有明确的离开动作
+        /(?:逃离|摆脱|远离|断绝|断亲|拉黑|屏蔽).{0,10}(?:原生家庭|父母|我妈|我爸|爹妈|亲妈|亲爸)/,
+        /(?:和|跟|与).{0,6}(?:父母|我妈|我爸|爹妈).{0,6}(?:断绝关系|断联|断绝往来|一刀两断)/,
+        // 倒装写法：「我妈催婚催到我想断绝关系」「父母让我想断亲」。
+        // 人物词在前、动作在后 —— 上面那条只盖「和父母断绝关系」这种正装。
+        /(?:父母|我妈|我爸|爹妈|老爸|老妈).{0,16}(?:断绝关系|断亲|一刀两断|不想认)/,
+        // 「不要同情 / 原谅 / 拯救你的父母」：用户样本就是这个句式。
+        // 「不要」和「同情」之间可以有「永远都」之类，所以放宽到 8 字。
+        /(?:不要|别|停止|拒绝|放弃).{0,8}(?:同情|原谅|拯救|共情|可怜|救赎).{0,10}(?:父母|母亲|父亲|我妈|我爸|爹妈)/,
+        // 「恨自己的父母」这类直白指控。
+        // 要求有「自己的 / 我的」或直接接人物词，避免「恨」的泛指用法命中。
+        /(?:恨|怨恨|憎恨|讨厌).{0,4}(?:我的|自己的|你的)?(?:父母|母亲|父亲|妈妈|爸爸|原生家庭)/,
+        // 「NPD 父母」「自恋型父母」这类心理标签叙事
+        /(?:npd|自恋型|巨婴|吸血).{0,6}(?:父母|母亲|父亲|家庭)/i,
+      ],
+      // 不设 exempt：用户要的是这个题材全不看。
+      //
+      // 但**判据本身已经排掉了**容易误伤的内容：
+      // 母亲节 / 父亲节 / 母亲河 / 慈母手中线 / 孟母三迁 / 教父 / 父母爱情
+      // 都不含上面任何一个组合，所以不会被拦。
+      exempt: [],
+    },
+
+    // ---- 心理测试 / 人格标签 ----
+    quiz: {
+      label: '心理测试',
+      strong: [
+        /测测你|测试你的|心理测试|性格测试|人格测试|情感测试/,
+        /MBTI|九型人格|DISC性格|霍兰德|人格类型/,
+        /选一张图|第一眼看到|凭直觉选|哪个最像你/,
+        // 自评量表："PHQ-9 到底准不准"是心理测量学科普
+        /焦虑自测|自测量表|SCL-90|抑郁测试|抑郁自评(?!.{0,8}(?:准|有效|靠谱|信度|效度))/,
+      ],
+      weak: [/测试/, /量表/, /人格/, /性格/, /心理/, /自测/, /自评/],
+      weakNeed: 3,
+      exempt: [
+        // 心理测量学 / 学术讨论
+        /心理测量|量表编制|信效度|因素分析|测验理论/,
+        /心理学|精神病学|临床诊断|诊断标准/,
+        /论文|研究|综述|实证/,
+        // 对人格测验本身的批评 / 科普 —— "MBTI 真的有效吗"属于知识内容
+        /科学争议|有效性|靠谱吗|认同度|信度|效度|伪科学|不靠谱|批评|质疑/,
+      ],
+    },
+
+    // ---- 军事爽文 ----
+    // 「美军这次栽了，原因很现实」：卖的是民族情绪，不是军事知识。
+    // 真正的军事内容会写具体装备、战术、编制、战史，不会这么起标题。
+    warPorn: {
+      label: '军事爽文',
+      strong: [
+        /(美军|俄军|解放军|日军|印军|韩军|北约).{0,8}(栽了|怂了|跪了|怕了|慌了|现眼|没撤)/,
+        /(战争|军演|开战|动手).{0,6}(背后|真正原因|真相|我就直说)/,
+        // "这次考试栽了"不是军事内容，必须有军事主语
+        /(?:美军|俄军|解放军|日军|印军|韩军|北约|乌军).{0,8}这次.{0,4}(?:栽了|输惨|赢麻|惨败)/,
+        /(美帝|日寇|俄毛|三哥).{0,6}(这次|又|竟然)/,
+      ],
+      // 战争 / 航母 / 导弹 是军事史基础词（中途岛海战讲的就是这些），
+      // 三个凑一起正好越过 weakNeed=3。只留情绪化的写法。
+      weak: [/美军/, /俄军/, /军演/, /出兵/, /开战/, /舰艇/],
+      weakNeed: 4,
+      exempt: [
+        // 真正的军事 / 历史 / 国际关系内容
+        /军事史|战史|战役|战术|编制|装备|军事学|国防/,
+        /战略|地缘|国际关系|外交|安全研究|智库/,
+        /论文|研究|报告|分析|综述/,
+        /纪录片|档案|解密文件|回忆录/,
+      ],
+    },
+
+    // ---- 设问式营销体：为什么 + 人的群体 + 泛化断言 ----
+    // 「为什么现在的年轻人都存不下钱」「为什么女生都喜欢高的男生」
+    // 标题是一个悬念式设问，内容是一段无法核查的泛化议论。
+    //
+    // 与知识内容的区别是**问的对象**：
+    //   营销体问人的行为  → 为什么年轻人都不…／为什么大家都…
+    //   科普问物的属性    → 为什么天空是蓝色的／为什么指南针指向北方
+    // 后者的主语不是人的群体，所以不会被这条规则命中（实测 14/14 保留）。
+    whyBait: {
+      label: '设问式营销体',
+      strong: [
+        // "一有钱就变" 这种 一…就 结构也是典型泛化断言
+        /^(?:为什么|为何|为啥|為何).{0,16}(?:年轻人|中年人|老年人|男人|女人|男生|女生|男孩|女孩|国人|中国人|外国人|老外|大家|人们|现在的人|很多人|大多数人|老板|同事|领导|父母|孩子|夫妻|情侣|打工人|上班族|大学生|应届生).{0,14}(?:都|总是|永远|越来越|普遍|从来|就是|却|一.{0,3}就)/,
+      ],
+      weak: [
+        /^为什么/, /^为何/, /^为啥/,
+        /都/, /总是/, /越来越/, /普遍/, /很多人/, /大家/,
+      ],
+      weakNeed: 3,
+      exempt: [
+        // 学术形态：问人的行为也可以是正经研究
+        /人口学|社会学|经济学|统计学|人类学|心理学|社会调查|实证/,
+        /数据|研究|报告|论文|综述|分析|调查/,
+        // 自然 / 工程类知识锤点
+        /瑞利|散射|浮力|密度|热力学|电磁|折射|共振|惯性|熵|光速|相对论|量子|化学键|酶|细胞|基因|进化|定理|定律|方程|机制|原理|声学|流体|材料|电路|算法|协议|概率/,
+        // 纪录片 / 课程
+        /纪录片|公开课|讲座|课程/,
+      ],
+    },
+
+    // ---- 现象议论体：群体主语 + 集体化动作 + 升华式收尾 ----
+    // 「年轻人集体养大肥鱼，一场爱压抑的自救」这类。
+    // 把一件小事 / 一个热点包装成时代症候：前半句陈述“大家都在做某事”，
+    // 后半句用一个升华词收尾，信息量全在语感上，内容无法核查。
+    //
+    // 与 whyBait 的区别只是句式：whyBait 是「为什么」设问，
+    // 这一类是「群体 + 集体 + ，一场…」陈述。两者都不靠具体热点词——
+    // 蹭 DeepSeek 的换成蹭别的，规则不用跟着改。
+    //
+    // 三个条件缺一不可（逗号前群体词，逗号前集体化，逗号后升华收尾），
+    // 所以「年轻人集体考研，一份就业分析报告」不会命中 ——
+    // 它后半句是“报告”，不是“自救”。
+    socialTake: {
+      label: '现象议论体',
+      strong: [
+        /(?=[^，。！？]*(?:年轻人|当代青年|这届年轻人|如今的年轻人|当代年轻人|打工人|普通人|现代人|都市青年|成年人|中年人|大学生|全民|全网))(?=[^，。！？]*(?:集体|都在|纷纷|扎堆|一窝蜂|全在))[^，。！？]*[，,]\s*(?:一场|一个).{0,12}的(?:自救|溃败|革命|觉醒|逃离|反击|反抗|崩塌|狂欢|困局|症候|突围|沦陷|溃逃|出走|出口)/,
+      ],
+      // 不设 weak：单有「年轻人 + 集体」太常见（「年轻人集体考研」），
+      // 必须配上升华式收尾才算这个模板。
+      exempt: [
+        // 学术形态：真的在分析这个现象，而不是用现象当钩子
+        /社会学|人类学|人口学|经济学|统计学|心理学|社会调查|田野调查/,
+        /论文|研究|报告|综述|实证|数据分析|调研/,
+        // 新闻通报 / 法律事件：集体行动本身是事实，不是修辞
+        /判决|法院|通报|警方|警方通报|起诉|维权|仲裁|赔偿|事故|调查结果/,
+        /纪录片|公开课|讲座|访谈/,
+      ],
+    },
+
+    lowbrow: {
+      label: '土味低智',
+      strong: [
+        // 非主流："非主流经济学派"是正经学术讨论
+        /土味|社会摇|精神小伙|葬爱|非主流(?:穿搭|发型|音乐|头像|年代|审美)/,
+        /装疯卖傻|卖傻|扮丑|发癫|发疯/,
+        /土味情话|土味视频/,
+      ],
+      weak: [/尬/, /沙雕/, /土/, /魔性/],
+      weakNeed: 3,
+      exempt: [
+        // 在分析这种文化现象，而不是生产它
+        /社会学|文化研究|亚文化|传播学|分析|解剖|考据/,
+        /教程|怎么做|制作|幕后|编剧/,
+        /地方|方言|民俗|乡土|乡村/,
+        /歌剧|舞剧|话剧|交响/,
+      ],
+    },
+
+    flame: {
+      label: '引战撕逼',
+      strong: [
+        /地域黑|地图炮|互撕|开撕|撕逼|骂战/,
+        /网络对骂|隔空对骂|公开对线/,
+        // 带节奏：吉他/音乐里的节奏训练是正常内容
+        /引战|挑事|拉踩|(?:恶意|故意|黑粉|营销号).{0,4}带节奏/,
+        /diss|互喷|隔空喊话/,
+      ],
+      weak: [/喷子/, /杠精/, /骂/, /吵/],
+      weakNeed: 3,
+      exempt: [
+        /社会学|传播学|媒体研究|舆论|舆情分析/,
+        /法律|侵权|名誉权|网络暴力|治理/,
+        /辩论|辩论赛|观点交锋/,
+        // "对线"是 MOBA 术语（对线期），和引战无关
+        /游戏|电竞|上号|开黑|段位|对局|英雄|赛季|上分/,
+      ],
+    },
+  };
+
+  // 匹配优先级：越硬的冒犯越先判定，这样面板里显示的原因是准确的。
+  // （「走光瞬间合集，笑死」应该报"低俗"，而不是先被"笑死"当成搞笑段子）
+  const TOPIC_ORDER = [
+    // AI 剧情短剧排在 ai 之前：同样带模型名时，
+    // 「Claude 大小姐撒娇」报「AI剧情短剧」比「AI 内容」更准；
+    // 没有剧情词的「Claude 3.7 到底强在哪」落到下面的 ai 类。
+    'aiDrama',
+    // AI 模型账号也排在 ai 之前：整号不看比单条不看更彻底。
+    'aiAccount',
+    // AI 标注是标题里最显眼的一层信息，先判它，面板报出的原因也最直观。
+    'ai',
+    // 猫meme 也很专指：标题/UP 名带标记就是这类内容，不该被后面的"搞笑"类抢答。
+    'meme',
+    // 升学导师同样专指：名字就是指纹，比 exam 的话题词更直接。
+    'tutor',
+    'vulgar',
+    // 死亡猎奇与 vulgar 同层：都是“不想看的负面内容”，但报的原因不同。
+    'deathBait',
+    'gambling', 'binge', 'flame',
+    // 伪科普放得很前：它蹭知识保护，拖到后面容易被别的类先豁免掉
+    'pseudoscience',
+    // 外网搬运比爽文更基础：来源是搬运，情绪只是其中一种标签。
+    // 「推特热议：中国高铁让美国人破防」两个都命中时，报「外网搬运」更准。
+    'repost',
+    'foreignAwe', 'gossip', 'superstition', 'hustle',
+    // 厚黑权术排在 mindset 之前：「底层逻辑 + 拿捏人心 + 记住这4招」两个都命中，
+    // 报「厚黑权术」比报「成功学话术」更贴意图 —— 前者是教你对人下手。
+    // 它也排在 career 之前：career 原本有一条 /职场.{0,6}厚黑/，
+    // 现在「职场厚黑」会先落到这里，原因更准。
+    'manipulation',
+    'mindset', 'selfhelp', 'lowbrow',
+    // warPorn 与 foreignAwe 同层：都是民族情绪写法
+    'warPorn',
+    // gaming 排在低质娱乐之后、生活话题之前：游戏引战/擦边内容
+    // 由前面的类报出更准确的原因，纯游戏讲解则落到这里。
+    'gaming',
+    // 奥特曼也是纯 IP 偏好，与 gaming 同层：都是娱乐内容。
+    'ultraman',
+    // COS 与主播也是纯内容形态偏好，与 ultraman 同层。
+    // cosplay 排在 streamer 之前：用户样本「分析...主播事件」两个都可能命中，
+    // 但 cos 是更硬的那个指纹，报出来更贴意图。
+    'cosplay',
+    'streamer',
+    // 清史是纯题材偏好，不与其他类抢：放在生活话题之前，
+    // 这样「晚清女子的婚恋」报的是「清史内容」，不是「情感关系」。
+    // 锐评排名与清史同层：都是题材偏好。
+    // 排在 qing 之前 —— 「清朝十大名将排名」报「锐评排名」更能说明问题。
+    // 商业大佬同样排在 rankBait 之前：用户是因为**这个人**不看，
+    // 不是因为有排名 ——「马云十大演讲」报「商业大佬叙事」更贴意图。
+    // 外国政要与 tycoon 同层：都是「这个人不看」的人物偏好。
+    'tycoon',
+    'foreignPol',
+    'rankBait',
+    'qing',
+    'quiz', 'lifestyle', 'parenting', 'career',
+    // 原生家庭排在 gender / relationship 之前：
+    // 「原生家庭导致我不想结婚」同时命中 family 与 relationship（/婚/ 是单字，很宽），
+    // 但它本质是子女控诉父母，报「原生家庭」比报「情感关系」贴意图。
+    // family 的判据全是组合式（人物词 + 指控动作），比单字「婚」专指。
+    'family',
+    // whyBait 放在 gender/relationship 之后：涉及性别/婚恋的设问
+    // 由前面更专指的类报出准确原因，泛化的"为什么"落到这里。
+    'gender', 'relationship', 'whyBait',
+    // 现象议论体与 whyBait 同层：一个是设问句式，一个是陈述句式。
+    'socialTake',
+    'exam', 'accident', 'comedy',
+  ];
+
+  // 返回 { key, label, hit } 或 null
+  // author 参与判定：猫meme 类标题经常只写剧情，UP 名才是稳定指纹。
+  function matchTopic(title, author) {
+    const t = String(title || '');
+    const a = String(author || '');
+    if (!t && !a) return null;
+    const order = TOPIC_ORDER.filter((k) => TOPICS[k])
+      .concat(Object.keys(TOPICS).filter((k) => !TOPIC_ORDER.includes(k)));
+    for (const key of order) {
+      if (!CONFIG.topics[key]) continue;
+      const cfg = TOPICS[key];
+
+      // UP 主维度的硬命中。豁免不适用：这一类要的就是整号不看。
+      if (cfg.author && cfg.author.some((re) => re.test(a))) {
+        return { key, label: cfg.label, hit: 'UP:' + a, strong: true };
+      }
+
+      if (!t) continue;
+      // 先看豁免：命中任何一条就整类跳过
+      if (cfg.exempt && cfg.exempt.some((re) => re.test(t))) continue;
+
+      const strongHit = cfg.strong.find((re) => re.test(t));
+      if (strongHit) {
+        const m = t.match(strongHit);
+        return { key, label: cfg.label, hit: m ? m[0] : '' , strong: true };
+      }
+
+      const need = cfg.weakNeed || 2;
+      const weakHits = (cfg.weak || []).filter((re) => re.test(t));
+      if (weakHits.length >= need) {
+        const m = t.match(weakHits[0]);
+        return { key, label: cfg.label, hit: (m ? m[0] : '') + '×' + weakHits.length, strong: false };
+      }
+    }
+    return null;
+  }
+
+  /* ---------------------------- 标题话术库 ----------------------------
+     每一项算作"营销信号"。强信号权重 2，中等 1，弱 0.5。
+     判定不看单项，看信号累计 + 时长的组合，避免误伤正常短视频。      */
+
+  // "震惊"有两种用法：
+  //   动宾（新闻体）：“震惊印度 1.3亿选民信息凭空消失” — 使印度震惊，事实陈述
+  //   情绪（营销体）：“震惊！原来…”“震惊全网” — 纯情绪夸张
+  // 只中和"震惊 + 具体国家/机构"；"全国/全网/世界/所有人"仍按营销号算。
+  const OV_OBJECT = /震惊(?:印度|美国|日本|韩国|欧洲|德国|法国|英国|俄罗斯|伊朗|以色列|乌克兰|土耳其|巴西|阿根廷|南非|埃及|墨西哥|加拿大|澳大利亚|意大利|西班牙|联合国|安理会|国会|参议院|众议院|白宫|五角大楼|克里姆林宫|欧盟|北约|世卫组织|世界银行|国际奥委会)/g;
+  function stripOvdObjects(t) { return String(t || '').replace(OV_OBJECT, ''); }
+
+  const STRONG = [
+    /震惊|惊呆|惊呆了/, /万万没想到/, /炸裂|炸了/, /直接封神|封神了/, /破防/,
+    /太离谱|离谱/, /划走/, /速看/, /看哭了|泪目/, /绷不住/, /谁懂啊/, /真的会谢/,
+    /狠狠地/, /笑不活了/, /绝了|太绝了/, /封神/,
+  ];
+  const MEDIUM = [
+    /没想到/, /建议收藏|先收藏|收藏起来/, /一定要/, /必看|必须看|看完你就|看完这个/,
+    /揭秘|内幕|真相|背后真相/, /全网/, /涨知识|冷知识/, /干货/, /新手必/,
+    /别再/, /后悔/, /注意了|提醒你/, /赶紧/, /(全网|排名|销量)第一/,
+    /天花板|王炸|神仙|顶配/,
+    /兑换码|限时|即将过期|马上删/,
+  ];
+  const WEAK = [
+    /原来/, /竟然|居然/, /这才是/, /第一次|首个|首款/,
+  ];
+
+  /* ------------------------------------------------------------------ */
+  /*                          标题信号分析                                */
+  /* ------------------------------------------------------------------ */
+  function analyzeTitle(title) {
+    const t = String(title || '');
+    const tM = stripOvdObjects(t);   // 动宾结构的"震惊"不算情绪信号
+    let signals = 0;
+    const hits = [];
+    for (const re of STRONG) { if (re.test(tM)) { signals += 2; hits.push(re.source.slice(0, 6)); } }
+    for (const re of MEDIUM) { if (re.test(tM)) { signals += 1; hits.push(re.source.slice(0, 6)); } }
+    for (const re of WEAK)   { if (re.test(tM)) { signals += 0.5; } }
+
+    const bangs = (t.match(/[!！?？]/g) || []).length;
+    // 光有感叹号不算营销，只算半个信号（必须叠加话术才定罪）
+    if (bangs >= 3) { signals += 0.5; hits.push('标点堆叠'); }
+
+    // 标题极短且无标点以外的信息量：轻微信号
+    if (t.trim().length <= 5 && bangs === 0) { signals += 0.5; }
+
+    return { signals, hits };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                     营销号文案指纹（大字报专用）                      */
+  /*  2-10 分钟是大字报的重灾区：时长不短，标题却是典型营销号叙述句。      */
+  /*  关键区分：正常内容自带栏目标记（【IGN】/万字精讲/P3/MV），          */
+  /*           营销号是无标记的纯叙述句。                                */
+  /* ------------------------------------------------------------------ */
+  // 结构类信号（长度、逗号、句末标点、口语叙述…）是同一个现象的多个侧面，
+  // 不是独立证据。无上限累加会让"为什么超市里很少见到鹅肉"这种正经科普
+  // 拿到 10 分。所以单独记账并设上限，语义信号才不受限制。
+  // 结构分封顶。
+  // 必须 ≥ CONFIG.fpLongThreshold：否则长视频里「纯结构分」永远够不到门槛
+  // —— 结构特征是长视频的主力判据（fp = min(struct, CAP) + sem + neg）。
+  // 4.13.0：4 → 6。取 4 时结构分刚好等于长视频门槛，
+  // 结构分拉满就过线 —— 200 次真实推荐流实测里，长期视频被质量层挡下的
+  // 170 条中有相当一部分是旅行/美食 vlog、体育评论。用户取向是“宁可错杀”。
+  const STRUCT_CAP = 6;
+
+  // 游戏语境的判定：只认游戏专指词。
+  // 用途是区分“攻略/实况/开箱/讲解”到底是什么 —— 在旅游、数码、影评里
+  // 这些是栏目标记（不该砍），在游戏里它们就是这类内容本身（不该保护）。
+  const GAME_CTX = /炉石|Hearthstone|星穹铁道|原神|绝区零|鸣潮|明日方舟|王者荣耀|英雄联盟|无畏契约|瓦罗兰特|暗区|和平精英|绝地求生|PUBG|穿越火线|守望先锋|永劫无间|剑网3|剑网三|逆水寒|梦幻西游|地下城与勇士|DNF|影之刃零|黑神话|艾尔登法环|只狼|塞尔达|宝可梦|Pokemon|怪物猎人|魔兽世界|最终幻想|我的世界|Minecraft|MC.{0,8}(?:模组|地图|地牢|整合包)|卡组|天梯|上分|上段|抽卡|卡池|兑换码|星琼|纠缠之缘|满命|精五|毕业装|战令|通行证|测试服|体验服|公测|开服/i;
+
+  function marketingFingerprint(title) {
+    const t = String(title || '').trim();
+    const len = t.length;
+    const gameCtx = GAME_CTX.test(t);   // 游戏语境：见 GAME_CTX 注释
+
+    // 营销词分两级。
+    // 极度营销词（揭秘/震惊/盘点…）一票否决知识保护 —— 它们几乎只在营销号里出现。
+    // 中度营销词（真相/尘封/绝唱…）在学术语境里也会用：
+    // 「考古发现的真相：二里头到底是不是夏都」是正经文献讨论，
+    // 不能因为用了"真相"就把"考古"的 −3 吃掉。
+    const HARD_MARKETING = /震惊|盘点|揭秘|内幕|鲜为人知|野史|奇闻|重磅|惊呆了|千万不要告诉|偷偷看/;
+    const MILD_MARKETING = /真相|尘封|绝唱|秘闻|不为人知|无人知晓/;
+    // 只会出现在学术/文献语境的词：有它们就能抵消中度营销词的分
+    const ACADEMIC_ANCHOR = /考古|文献|史料|墓葬|出土|文物|博物馆|遗址|朝代|论文|期刊|实证|综述|考据|版本学/;
+    let struct = 0;   // 结构分：有上限
+    let sem = 0;      // 语义分：营销词/价格/叙事/悬念等，无上限
+    let neg = 0;      // 正常内容的减分
+    const why = [];
+
+    // "震惊"有两种用法，不能一视同仁：动宾结构（"震惊印度"）是新闻标题写法的
+    // 事实陈述，情绪夸张（"震惊！""震惊全网"）才是营销号。
+    // 共用模块级的 stripOvdObjects 中和掉动宾用法；"全国/全网/世界"不豁免。
+    const tM = stripOvdObjects(t);   // 中和掉动宾用法后的标题，专供营销/情绪判断
+
+    // 情绪爆点：标题卖的不是信息，而是"看完之后的强烈反应"。
+    // 既用于"情绪反应型标题"加分，也用于取消知识词的免责效果。
+    const emotionSpike = /后背发凉|头皮发麻|汗流浃背|不寒而栗|破防|泪目|看哭|哭死|跪了|傻眼|震惊|惊呆|不敢相信|心服口服|肃然起敬|沉默良久|沉默不语|全场沉默|直呼|自愧不如|无地自容|睡不着|害怕|恐惧|心惊/.test(tM);
+
+    // ---- 正常内容的标记（负分）----
+    let labelled = false;
+    if (/【[^】]{1,24}】/.test(t)) { neg -= 2; labelled = true; }
+    if (/[｜|]/.test(t)) { neg -= 1; labelled = true; }
+    if (/#[^\s#]{1,14}/.test(t)) { neg -= 1; }
+    if (/(MV|PV|OP|ED|vlog|Vlog|VLOG)\b/.test(t)) { neg -= 2; labelled = true; }
+    // 注意：不含"指南/手册"——营销号最爱用"避坑指南"这类词装饰门面
+    if (/攻略|实况|教程|讲解|评测|拆解|精讲|复盘|测评|开箱|合集|纪录片|花絮|混剪|手书|翻唱|直播回放/.test(t)) {
+      // 游戏内容里的"攻略/实况/开箱/合集/讲解"不是在标栏目，是在报内容形态
+      // 本身。给了 −2 就是给游戏稿每一条发免死金牌，首页会被游戏灌满。
+      if (gameCtx && /攻略|实况|开箱|合集|讲解/.test(t)) {
+        why.push('游戏形态');
+      } else { neg -= 2; labelled = true; }
+    }
+    if (/第[一二三四五六七八九十百\d]+[集期话章回卷]/.test(t)) { neg -= 2; labelled = true; }
+    if (/[Pp]\d+\s*$/.test(t)) { neg -= 1; labelled = true; }
+    if (/《[^》]{1,24}》/.test(t)) { neg -= 1; labelled = true; }
+
+    // ---- 抽象概念词：学术/科普内容常用 ----
+    // （"为什么热衷于理解一切是一种防御？"是被误伤的心理学内容）
+    // 只收营销号不写的硬学术词。"认知 / 逻辑 / 本质 / 边界"曾经也在这张表里，
+    // 结果是给了成功学号免死金牌：「阶层跨越的底层逻辑」拿到 −2，
+    // 「认知觉醒：为什么你越努力越穷」被 −2 抵消掉空洞升华的 +2。
+    // 这四个词营销号用得比学术内容还多，不能单独作为学术证据。
+    if (/防御|机制|原理|效应|规律|定理|模型|算法|协议|函数|变量|神经|哲学|伦理|美学|范式|范畴|诺贝尔|实验|论文|研究|数据表明|人口学|统计学|经济学|社会学/.test(t)) {
+      neg -= 2; why.push('学术词');
+    }
+
+    // ---- 强正常信号：英文专名 ----
+    // 中文营销号几乎不会在标题里写英文技术名词，这条能救回技术类内容
+    const ABBR = /^(AI|NPC|MV|PV|OP|ED|UP|VC|VR|AR|CG|TV|PC|PS|DJ|KTV|APP|GP|FPS|RPG|ACG|VLOG|DIY|3D|4K|8K|2K|HD|BD)$/i;
+    const latin = (t.match(/\b[A-Za-z][A-Za-z0-9+#.]{2,}\b/g) || [])
+      .filter((w) => !ABBR.test(w));
+    if (latin.length) { neg -= 2; why.push('英文专名'); }
+
+    // ---- 营销号标记（正分）----
+    // 只按长度加分是不准的：中文长标题普遍如此，围棋题、技术讲解都中招。
+    if (len >= 18) struct += 1;
+    if (len >= 28) struct += 1;
+
+    const commas = (t.match(/[，,]/g) || []).length;
+    if (commas >= 2) { struct += 1; why.push('多短句'); }
+
+    const q = (t.match(/[？?]/g) || []).length;
+    const ex = (t.match(/[！!]/g) || []).length;
+    if (/[！!？?。…]$/.test(t)) { struct += 1; why.push('句末标点'); }
+    if (q >= 2) { struct += 1; why.push('双问句'); }
+    // 省略号出现两次以上 = 拼凑感，正常标题很少这么用
+    if ((t.match(/…+|\.{3,}/g) || []).length >= 2) { struct += 2; why.push('省略号堆叠'); }
+    // 标点密度而非绝对数量：长标题天然标点多，不能一律算堆叠
+    if (q + ex >= 4 && (q + ex) / Math.max(len, 1) >= 0.08) { struct += 1; why.push('标点密集'); }
+
+    // 短标题还堆一堆感叹号/问号 = 典型标题党
+    // （"免签！消费低！风景平替瑞士？"）正常内容很少这么写
+    if (len < 22 && (q + ex) >= 3) {
+      sem += 2; why.push('标题党标点');
+    }
+
+    // 引导互动 / 催促动作：营销号收尾的标准姿势
+    if (/收藏[并起好]|记得收藏|一键三连|点赞关注|关注我|评论区|转发给|学起来|用起来/.test(t)) {
+      sem += 2; why.push('引导互动');
+    }
+
+    // 标题里堆 3 个以上话题标签 = 在凑搜索关键词
+    // （"#中国历史 #历史"这种同义重复，作者自己都不打算让人读）
+    const tagCount = (t.match(/#[^\s#]{1,14}/g) || []).length;
+    if (tagCount >= 3) { sem += 1; why.push('话题堆叠x' + tagCount); }
+
+    // 纯情绪反应型标题：没有任何可核查的信息，重点全在"反应有多强烈"。
+    // （"读中国史书，越读越后背发凉"）配上无栏目标记就是营销号叙事。
+    if (emotionSpike && !labelled && len >= 12) {
+      sem += 1; why.push('情绪爆点');
+      // "越读越…" 递进句式是这类叙事的标准骨架
+      if (/越[看读听学吃玩做].{0,8}越/.test(t)) { sem += 1; why.push('递进+情绪'); }
+    }
+
+    // 空洞抒情句：字很多但没有任何可核查的信息
+    // （"我们都在寻找自己的25号底片 却忘了自己就是答案本身"）
+    // 注意不要写"真相" —— "考古发现的真相"会被误判；
+    // 且"真相"已经由营销词层单独计分，重复计分等于双重惩罚。
+    if (len >= 18 && /的.{0,4}(本身|意义|答案|模样|样子|尽头|开始|终点)|就是(你|我|自己|答案)/.test(t)) {
+      sem += 2; why.push('空洞抒情');
+    }
+
+    // 空洞升华：把一件小事拔高到价值观层面，是大字报的口号式收尾
+    if (/三观|正能量|格局|境界|人生|人性|良知|底线|初心|觉醒|顿悟|通透/.test(t)) {
+      sem += 2; why.push('空洞升华');
+    }
+
+    // 清单体洗稿："十个你绝对不知道的冷知识"。
+    // 这类是 AI 批量生产的典型形态：数字 + 量词 + 知识类名词，
+    // 配上情绪化形容词。它故意带着"知识/事实/发现"这些词，
+    // 所以必须能在质量层识别出来，不能指望 KNOWLEDGE 词表。
+    if (/(?:十|十[一二三四五六七八九]|\d{1,2})\s*[个条种大]/.test(t)
+        && /冷知识|事实|发现|真相|秘密|细节|知识|瞬间/.test(t)) {
+      sem += 2; why.push('清单体');
+    }
+    if (/最.{0,3}(恐怖|惊人|诡异|不可思议|震撼)的/.test(t)) {
+      sem += 1; why.push('夸张形容');
+    }
+    // 不带"最"的情绪形容（"十个惊人事实"这种偏正结构，中间没有"的"）
+    if (/(惊人|恐怖|诡异|不可思议|震撼|颠覆|毛骨悚然)(的|事实|发现|真相|秘密|现象|结论)/.test(t)) {
+      sem += 1; why.push('情绪形容');
+    }
+    // 绝对化包装：用"没人告诉你"制造信息差假象
+    if (/绝对不知道|绝对不会告诉你|没人告诉你|没人敢说|不会有人告诉/.test(t)) {
+      sem += 2; why.push('绝对化包装');
+    }
+
+    // 热点点评体：借公共事件输出情绪，本身不提供任何信息
+    if (/(全网|所有人|大家都在).{0,8}(吵|骂|讨论|热议|刷屏)/.test(t)
+        && /我想说|我的看法|说两句|说几句|聊两句/.test(t)) {
+      sem += 2; why.push('热点点评');
+    }
+
+    // 这类"内容形态"本身就是营销号：盘点/揭秘/震惊体
+    if (/震惊|盘点|揭秘|内幕|鲜为人知|野史|奇闻|重磅|惊呆了|千万不要告诉|偷偷看/.test(tM)) {
+      sem += 4; why.push('营销词');
+    } else if (MILD_MARKETING.test(tM)) {
+      // 中度营销词："真相 / 尘封 / 绝唱"。学术锤点在场时降到 +1，
+      // 否则「考古发现的真相：二里头是不是夏都」会被当成大字报。
+      if (ACADEMIC_ANCHOR.test(t)) { sem += 1; why.push('轻微营销词'); }
+      else { sem += 4; why.push('营销词'); }
+    }
+    // 价格锚点：带货营销号的标准姿势（"几十块买到世界顶尖"）
+    // 正常内容说价格通常带具体数字与型号，很少用这种笼统锚点
+    if (/几十块|几块钱|白菜价|仅需\s*\d|只要\s*\d|不到\s*\d+\s*[块元]|\d+\s*块[钱包]?搞定/.test(t)) {
+      sem += 3; why.push('价格锚点');
+    }
+    // "世界顶尖/顶级/最强" + 低价 = 典型带货句式
+    if (/世界(顶尖|顶级|级)|行业(顶尖|顶级)|国际大牌/.test(t) && /\d/.test(t)) {
+      sem += 2; why.push('顶级+价格');
+    }
+    // 悬念 / 说教口吻。
+    // 中性疑问词（为什么/为何/怎么）在正经科普里遍地都是，只给半分的分量；
+    // 强悬念词（竟然/居然/背后/到底…）才是营销号口气。
+    const susStrong = t.match(/竟然|居然|终于|原来|当年|背后|到底|看完|懂了|这才是|不为人知|无人知晓/g);
+    const susWeak = t.match(/为何|为什么|怎么|如何/g);
+    if (susStrong) { sem += 1; if (susStrong.length >= 2) sem += 1; }
+    if (susWeak) { sem += 0.5; if (susWeak.length >= 2) sem += 0.5; }
+    if (susStrong || susWeak) {
+      why.push('悬念词x' + ((susStrong || []).length + (susWeak || []).length));
+    }
+
+    // 无栏目标记的口语叙述句 = 营销号最典型形态
+    // 正常视频标题是名词短语（"45米高空坠物测试"），营销号是完整叙述（"我刚发现…结果…"）
+    if (!labelled && len >= 14) {
+      const colloquial = /了|着|过的|真是|太|就|还|都|才|又|怎么|什么|为什么|结果|后来|然后|居然|竟然|原来|其实|竟然|直接|简直/,
+            hit = t.match(colloquial);
+      if (hit) { struct += 1; why.push('口语叙述'); }
+      // 无标记 + 长 + 句末标点 = 强叙述句
+      if (len >= 20 && /[。！!？?…]$/.test(t)) { struct += 2; why.push('无栏目标记长句'); }
+    }
+
+    // 叙事悬念长句：营销号"讲故事"的标准写法
+    // 例：工人在清理河底淤泥时，无意间发现…竟然是…
+    // 这类句式几乎只在营销号里出现，给足权重
+    if (len >= 36 && /竟然|无意间|结果|没想到|谁料|不料|发现自己/.test(t)) {
+      sem += 3; why.push('叙事长句');
+    }
+
+    // 具体年份 + 长标题 = 历史叙事营销号的强特征
+    if (/(19|20)\d{2}\s*年/.test(t) && len >= 20) { sem += 2; why.push('年份+长标题'); }
+    else if (/\d{2,}\s*年[前后]|\d+年[前后]/.test(t)) { sem += 1; }
+
+    // ---- 客观知识信号：用户来 B 站是为了获取知识，这类内容不该被误杀 ----
+    // 营销号不会写"为什么超市里很少见到鹅肉"这种可核查的解释性问题。
+    // 知识词只收题材专指的学术名词。
+    // 用"小说/戏剧/建筑/美术"这类词会出事：营销号把它们当修辞用
+    // （"现实比小说还离谱"），一句 −3 就把大字报洗白了。
+    // 所以收的是"艺术史/绘画/建筑学"这种不会出现在情绪句里的写法。
+    const KNOWLEDGE = /生物|动物|植物|物种|生态|进化|演化|起源|宇宙|天文|星系|地球|地质|岩石|气候|气象|物理|化学|数学|几何|代数|概率|统计|方程|定律|定理|医学|生理|解剖|病理|神经|基因|细胞|免疫|病毒|细菌|历史|考古|文献|朝代|墓葬|出土|文物|博物馆|汉墓|遗址|语言学|心理学|哲学|文学史|诗歌|散文|美学|艺术史|绘画|雕塑|书法|建筑学|建筑史|古建筑|人类学|社会学|天文学|量子力学|量子纠缠|相对论|熵增|工程|机械|电子|电路|通信|数据库|算法|养殖|种植|农作物|家禽|牲畜|农业|音乐|乐理|小调|大调|和弦|音阶|编曲|作曲|摄影|构图|光圈|快门|镜头/i;
+    // "模组"只在非游戏语境里算知识词：游戏模组是游戏内容，不是物理/工程
+    const MOD_WORD = /模组|\bMOD\b/i;
+    // 营销词分两级。
+    // 极度营销词（揭秘/震惊/盘点…）一票否决知识保护 —— 它们几乎只在营销号里出现。
+    // 中度营销词（真相/尘封/绝唱…）在学术语境里也会用：
+    // 「考古发现的真相：二里头到底是不是夏都」是正经文献讨论，
+    // 不能因为用了"真相"就把"考古"的 −3 吃掉。
+    // 洗稿形态：清单体 + 绝对化包装。这类标题故意带"宇宙 / 大脑 / 历史"
+    // 这些 KNOWLEDGE 词，如果让知识词照常减分，它们就永远拦不住。
+    const SHELL_FORM = /(?:十|十[一二三四五六七八九]|\d{1,2})\s*[个条种大]|绝对不知道|绝对不会告诉你|没人告诉你|没人敢说/;
+    if (KNOWLEDGE.test(t) || (MOD_WORD.test(t) && !gameCtx)) {
+      if (HARD_MARKETING.test(tM)) {
+        // 极度营销词压过知识词，不减分
+      } else if (MILD_MARKETING.test(tM) && ACADEMIC_ANCHOR.test(t)) {
+        // 学术锤点命中："真相"在这里是正常用词，知识保护照常生效
+        neg -= 3; why.push('知识内容(学术锚点)');
+      } else if (emotionSpike) {
+        // "历史/科学/工程"在这里只是题材标签，标题真正的卖点是情绪反应，
+        // 不能拿知识词当免死金牌
+        why.push('知识词失效(情绪爆点)');
+      } else if (SHELL_FORM.test(t)) {
+        // 同理：清单体洗稿里的"宇宙/大脑/历史"只是选题标签
+        why.push('知识词失效(清单体)');
+      } else {
+        neg -= 3; why.push('知识内容');
+      }
+    }
+
+    // 现象解释疑问句：正经科普的标准写法（"为什么超市里很少见到鹅肉"）。
+    // 只认描述客观量变的词，不认情绪疑问（"为什么会爱而不得"不该被救回）。
+    if (/(为什么|为何|怎么).{2,}(很少|没有|不见|越来越多|越来越少|越来越贵|越来越便宜|更便宜)/.test(t)) {
+      neg -= 3; why.push('现象解释');
+    }
+
+    // 结构分封顶，语义分不封顶 —— 结构特征是同一个现象的多个侧面，
+    // 不能当独立证据累加。
+    const fp = Math.min(struct, STRUCT_CAP) + sem + neg;
+    return { fp, why, sem, struct: Math.min(struct, STRUCT_CAP) };
+  }
+
+  // 时长文本 → 秒。必须够宽容：抓不到就变成“时长未知”，
+  // 而时长未知是不删的（见 decide），于是短视颂会直接漏网。
+  //
+  // 实测会遇到的写法：
+  //   "2:59"  "03:00"  "1:02:03"  "2：59"（全角）
+  //   "2:59 HD"  "时长 2:59"  "2:59\n"  " 02:59 "
+  // 所以不能直接 split(':') —— 一个多余字符就让整条变成 null。
+  function parseDuration(text) {
+    if (text == null) return null;
+    const s = String(text).replace(/[：]/g, ':').trim();
+    if (!s) return null;
+    // 从任意位置抓第一个 h:mm:ss 或 m:ss。
+    // 前面不能紧贴数字：否则 "2024:10" 会被抓成 "24:10"。
+    const m = s.match(/(?:^|[^\d])(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+    if (!m) return null;
+    const nums = [m[1], m[2], m[3]].filter((x) => x !== undefined).map(Number);
+    if (nums.some((n) => Number.isNaN(n))) return null;
+    // 低位必须 < 60：否则 "2024:10" 这种不是时长
+    for (let i = 1; i < nums.length; i++) if (nums[i] >= 60) return null;
+    return nums.reduce((acc, n) => acc * 60 + n, 0);
+  }
+
+  // "18.8万" → 188000，"1.2亿" → 120000000，纯数字原样
+  function parseCount(text) {
+    if (text == null) return null;
+    const m = String(text).trim().match(/([\d.]+)\s*([万亿]?)/);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    if (Number.isNaN(n)) return null;
+    if (m[2] === '万') return Math.round(n * 10000);
+    if (m[2] === '亿') return Math.round(n * 100000000);
+    return Math.round(n);
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                          单条视频判定                                */
+  /* ------------------------------------------------------------------ */
+  function scoreItem(it) {
+    const why = [];
+    const owner = it.owner || {};
+
+    // 关注过的 UP 主：永远保留（最高优先级，保底机制不可覆盖）
+    if (it.is_followed === true) {
+      // 记下 mid，供 DOM 层复用（cardInfo 拿不到 is_followed）
+      if (owner.mid != null) followedMids.add(String(owner.mid));
+      return { score: 999, signals: 0, hide: false, hard: true, why: ['已关注'] };
+    }
+    // 手动放行：用户点过 ✅，永不屏蔽（优先级高于黑名单与所有规则）
+    if (allow.has(owner.mid)) {
+      return { score: 999, signals: 0, hide: false, hard: true, why: ['白名单:' + (owner.name || owner.mid)] };
+    }
+    // 手动拉黑：永远隐藏（保底机制不可覆盖）
+    // neverKeep 是给保底用的硬标记：手动拉黑是用户明确的意志，
+    // 不能被 keepAtLeast 补回。（主题命中可以补——那是为了防止接口空数组）
+    if (store.has(owner.mid)) {
+      return { score: -999, signals: 99, hide: true, hard: true, neverKeep: true, why: ['黑名单:' + (owner.name || owner.mid)] };
+    }
+
+    const goto = it.goto || 'av';
+    const d = Number(it.duration) || 0;
+
+    // 直播：接口层见到 goto=live 直接拦。
+    // 实际从未触发（hook 不生效），留着是为了接口恢复时行为一致。
+    if (CONFIG.hideLive && (goto === 'live' || goto === 'live_room')) {
+      return { score: -999, signals: 99, hide: true, hard: true, why: ['直播'] };
+    }
+
+    // 广告：排在白名单/黑名单之后、主题与时长之前。
+    // 放在这里是因为广告是平台推的位置，跟 UP 的内容质量无关；
+    // 但用户亲手放行的 UP 仍然优先（白名单在上面已经 return 了）。
+    // neverKeep：广告不该被 keepAtLeast 补回来 —— 补回一条广告最没意义。
+    if (CONFIG.hideAds && isAdItem(it)) {
+      return { score: -999, signals: 99, hide: true, hard: true, neverKeep: true, why: ['广告位'] };
+    }
+    const { signals, hits } = analyzeTitle(it.title);
+    let sig = signals;
+    if (hits.length) why.push('标题:' + hits.slice(0, 3).join(','));
+
+    // 互动异常：高播放 + 极低点赞率 = 标题党典型
+    const stat = it.stat || {};
+    const view = Number(stat.view) || 0;
+    const like = Number(stat.like) || 0;
+    if (view >= 100000) {
+      const ratio = like / view;
+      if (ratio < 0.003) { sig += 2; why.push('点赞率极低'); }
+      else if (ratio > 0.08) { sig -= 1; why.push('高点赞率'); }
+    }
+
+    // 4.33.0：这段是 hideLive 的老实现，判据是 !isVideo ——
+    // 意味着只要 goto 不是 av/ogv/bangumi 就一律隐藏。
+    // 一旦把 hideLive 的默认值改成 true，badge / loading / download
+    // 这些垃圾值也会跟着被当成「非视频流」拦下（实测这批断言全红）。
+    // 直播的精确判定已经挪到上面（goto === 'live' || 'live_room'），
+    // 所以这里删掉，不再用「不是视频就是直播」的近似。
+
+    // 统一判定（与页面层共用同一套逻辑）
+    const dec = decide(d, it.title, (it.owner || {}).name, it.owner && it.owner.mid);
+    const hide = dec.hide;
+    dec.why.forEach((w) => why.push(w));
+
+    // 主题命中 / 时长不足视为硬性拦截：用户明确不想看，不该被保底机制补回来。
+    // shortVideo 不写成 topic：两者都要 hard，但只有 topic 会累计并拉黑 UP。
+    const hard = !!dec.topic || !!dec.shortVideo;
+
+    const score = hide
+      ? -100 - dec.fp * 10
+      : Math.round(sig * 5 + Math.min(d / 600, 5));
+
+    return { score, signals: sig, fp: dec.fp, hide, hard, topic: dec.topic, why };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*        时长 + 标题 → 是否隐藏（接口层与页面层共用的唯一判定）          */
+  /* ------------------------------------------------------------------ */
+  function decide(d, title, author, mid) {
+    const mode = CONFIG.mode;
+    if (allow.has(mid)) return { hide: false, fp: 0, why: ['白名单'] };
+    const why = [];
+    const { signals, hits } = analyzeTitle(title);
+    const { fp, why: fpWhy, sem } = marketingFingerprint(title);
+    // 4.0 起不再区分语义/结构信号：大字报的标题往往干净得没有任何营销词，
+    // 结构特征（口语叙述、无栏目标记的长句、标题党标点）才是主力判据。
+    // 误杀由 UP 主白名单兜底 —— 点卡片上的 ✅ 即可永久放行。
+    const tMid = CONFIG.fpThreshold;
+    const tLong = CONFIG.fpLongThreshold;
+    if (fpWhy.length) why.push('文案:' + fpWhy.slice(0, 3).join(','));
+
+    if (mode === 'off') return { hide: false, fp, why: ['模式关闭'] };
+
+    // 主题屏蔽先于一切质量判断：话题不想看就是不想看，
+    // 跟这条视频拍得好不好、多长、文案几分没有关系。
+    const topic = matchTopic(title, author);
+    if (topic) {
+      return {
+        hide: true,
+        fp,
+        topic: topic.key,
+        why: ['主题:' + topic.label + (topic.hit ? '(' + topic.hit + ')' : '')],
+      };
+    }
+
+    if (!(d > 0)) return { hide: false, fp, why: ['时长未知，跳过'] };
+
+    // 硬时长下限：不足 minKeepDuration 一律不看。
+    //
+    // 放在这里而不是更前面，是因为：
+    //   - 白名单 / mode=off 仍优先（用户自己放行的不碰）；
+    //   - 时长未知（d=0）不在这里杀 —— 拿不到时长就当没有证据，
+    //     否则接口字段一缺失就会把整屏删空。
+    //
+    // 用 shortVideo 标记而不是 topic：「时长短」不是话题命中，
+    // 不能触发 bumpQuality（否则一个正常 UP 发 3 条短视频就被拉黑整号）。
+    if (CONFIG.minKeepDuration > 0 && d > 0 && d < CONFIG.minKeepDuration) {
+      return {
+        hide: true, fp, shortVideo: true,
+        why: ['时长不足' + Math.round(CONFIG.minKeepDuration / 60) + '分钟(' + d + 's)'],
+      };
+    }
+
+    if (hits.length) why.push('话术:' + hits.slice(0, 2).join(','));
+    let hide = false;
+
+    // 分层策略：短视频用语术词库（敏感），中长视频用文案指纹（精准）
+    //
+    // 档位语义必须单调：aggressive ⊇ balanced ⊇ light 的隐藏集合。
+    // 早先 aggressive 在 <60s 只认 fp>=2，而 balanced 在 <60s 认 signals>=1，
+    // 结果「干货分享｜我的桌面」这种 20s 视频调严反而被放行 —— 档位反转。
+    // 现在短视频分支合并了 balanced 的条件，保证 aggressive 真的更严。
+    if (mode === 'aggressive') {
+      // 权威媒体豁免必须是真的豁免。
+      // 早先只拦住短分支，后面的 `signals >= 4` 兜底又把它杀回去：
+      // {author:'央视军事', d:45, title:'速看！太离谱！…'} 会同时出现
+      // 「权威媒体短新闻，放行」和「强营销话术」两条理由，结果 hide=true。
+      if (OFFICIAL.test(String(author || '').trim())) {
+        return { hide: false, fp, why: why.concat(['权威媒体，整体放行']) };
+      }
+
+      if (d < 60 && (signals >= 1 || fp >= CONFIG.shortFpThreshold)) {
+        hide = true; why.unshift('极短+话术');
+      } else if (d < CONFIG.aggressiveMax) {
+        // 短视频不看时长本身 —— 大量正常内容（游戏片段、绘画、美食）同样很短。
+        // 按指纹判，但门槛比中长视频低一分。
+        if (fp >= CONFIG.shortFpThreshold) {
+          hide = true; why.unshift('低质短视频');
+        }
+      } else if (d <= 600) {
+        if (fp >= tMid) { hide = true; why.unshift('大字报文案(2-10min)'); }
+      } else if (fp >= tLong) {
+        hide = true; why.unshift('大字报文案(长)');
+      }
+      // 长视频里的话术重灾区也兜一下
+      if (!hide && signals >= 4) { hide = true; why.unshift('强营销话术'); }
+    } else if (mode === 'light') {
+      if (d < 60 && signals >= 2) { hide = true; why.unshift('极短+话术'); }
+      else if (d < 120 && signals >= 3) { hide = true; why.unshift('短+话术'); }
+      else if (d <= 600 && fp >= 8) { hide = true; why.unshift('强文案'); }
+    } else {
+      // balanced：比 light 严，比 aggressive 松
+      if (d < 60 && signals >= 1) { hide = true; why.unshift('短+话术'); }
+      else if (d < 120 && (signals >= 2 || fp >= 5)) { hide = true; why.unshift('短+话术'); }
+      else if (d <= 600 && (fp >= 6 || signals >= 5)) { hide = true; why.unshift('中长+文案'); }
+      else if (d > 600 && (fp >= 9 || signals >= 6)) { hide = true; why.unshift('长+极强文案'); }
+    }
+
+    return { hide, fp, why };
+  }
+
+  function filterItems(items) {
+    // 防御非数组输入。接口层已经用 Array.isArray 挡了一层，
+    // 但 __BLF.filter 是对外暴露的调试入口，传错（null / undefined / 对象）
+    // 不应该抛异常 —— 抛了就断在那里，后续 hook 全部失效。
+    if (!Array.isArray(items)) return [];
+    const scored = items.map((it) => ({ it, ...scoreItem(it) }));
+    if (CONFIG.debug) {
+      scored.forEach((x) =>
+        console.log(TAG, String(x.score).padStart(5), (x.it.duration || '?') + 's',
+          '|', (x.it.owner || {}).name, '|', String(x.it.title).slice(0, 32),
+          x.hide ? '❌' : '✅', x.why.join(' '))
+      );
+    }
+    const keep = scored.filter((x) => !x.hide);
+    // 保底：砍太狠时按分数从高到低补回，避免首页被刷空。
+    //
+    // 注意：这个保底**必须包含 hard 项**。
+    // 早先的写法是 filter(x => x.hide && !x.hard)，理由是"主题命中不该补回"。
+    // 但接口层返回空数组有实际后果：B 站前端拿不到任何 item，
+    // 首页直接空白 / 无限滚动中断 —— 那比看到两条游戏视频糟得多。
+    // DOM 层不受影响：那边可以保持整屏清空（recoverIfEmpty 分别处理）。
+    // 所以：接口层硬保底，DOM 层不保底。
+    if (keep.length < CONFIG.keepAtLeast) {
+      const dropped = scored
+        .filter((x) => x.hide && !x.neverKeep)
+        .sort((a, b) => b.score - a.score);
+      while (keep.length < CONFIG.keepAtLeast && dropped.length) {
+        const pick = dropped.shift();
+        pick.keepAlive = true;   // 标记为保底，面板里可区分
+        keep.push(pick);
+      }
+    }
+    const keepSet = new Set(keep.map((x) => x.it));
+    const out = items.filter((it) => keepSet.has(it));
+    stats.apiSeen += items.length;
+    stats.apiHidden += items.length - out.length;
+
+    // 接口层隐藏的也要进面板。
+    // 否则：fetch 拦掉的整批在「最近拦截」里完全看不到，
+    // 徽章写着「拦 N」、面板却显示 0 —— 误杀无处申诉。
+    scored.forEach((x) => {
+      if (x.hide && !keepSet.has(x.it) && !x.keepAlive) {
+        recordHidden(x.it, { fp: x.fp, reason: (x.why || []).join(' '), topic: x.topic });
+      }
+    });
+
+    updateBadge();
+    return out;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                        接口层：拦截推荐流                            */
+  /* ------------------------------------------------------------------ */
+  function isFeedApi(url) {
+    if (typeof url !== 'string') return false;
+    return /\/x\/web-interface\/[^?]*feed\/rcmd/.test(url);
+  }
+
+  function rewriteFeedJson(json) {
+    const data = json && json.data;
+    if (!data) return json;
+
+    if (Array.isArray(data)) {
+      const out = filterItems(data);
+      return out.length === data.length ? json : { ...json, data: out };
+    }
+    if (Array.isArray(data.item)) {
+      const out = filterItems(data.item);
+      return out.length === data.item.length ? json : { ...json, data: { ...data, item: out } };
+    }
+    return json;
+  }
+
+  // ---- fetch ----
+  const origFetch = window.fetch;
+  if (typeof origFetch === 'function') {
+    window.fetch = function (...args) {
+      const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url);
+      const p = origFetch.apply(this, args);
+      if (!isFeedApi(url)) return p;
+      return p.then(async (res) => {
+        try {
+          const text = await res.clone().text();
+          const json = JSON.parse(text);
+          const out = rewriteFeedJson(json);
+          if (out === json) return res;
+          const headers = new Headers(res.headers);
+          headers.delete('content-length');
+          return new Response(JSON.stringify(out), {
+            status: res.status, statusText: res.statusText, headers,
+          });
+        } catch (e) {
+          log('fetch 重写失败，回退原始响应', e);
+          return res;
+        }
+      });
+    };
+  }
+
+  // ---- XMLHttpRequest（老接口兜底）----
+  const XHR = window.XMLHttpRequest;
+  if (XHR && XHR.prototype) {
+    const origOpen = XHR.prototype.open;
+    const origSend = XHR.prototype.send;
+    XHR.prototype.open = function (method, url, ...rest) {
+      this.__blfUrl = url;
+      return origOpen.call(this, method, url, ...rest);
+    };
+    XHR.prototype.send = function (...args) {
+      if (isFeedApi(this.__blfUrl)) {
+        this.addEventListener('readystatechange', () => {
+          if (this.readyState !== 4 || this.status !== 200) return;
+          const rt = this.responseType;
+          if (rt && rt !== 'text' && rt !== 'json') return;
+          try {
+            const raw = rt === 'json' ? this.response : JSON.parse(this.responseText);
+            const out = rewriteFeedJson(raw);
+            if (rt === 'json') {
+              Object.defineProperty(this, 'response', { configurable: true, value: out });
+            } else {
+              Object.defineProperty(this, 'responseText', { configurable: true, value: JSON.stringify(out) });
+            }
+          } catch { /* 忽略，用原始响应 */ }
+        });
+      }
+      return origSend.apply(this, args);
+    };
+  }
+
+  /* ------------------------------------------------------------------ */
+  /*                       DOM 层：兜底 + 一键屏蔽                        */
+  /* ------------------------------------------------------------------ */
+  const CARD_SEL = '.bili-video-card, .video-card-common, .feed-card, .bili-video-card__wrap';
+  const DURATION_SEL = '.bili-video-card__stats__duration, .so-imgTag_rb, [class*="duration"]';
+  const TITLE_SEL = '.bili-video-card__info--tit, h3, .title';
+
+  // 一个视频卡片最多含几个视频链接。超过这个数说明选到了列表容器，
+  // 隐藏它会把整片信息流清空 —— 必须拒绝。
+  const MAX_LINKS_PER_CARD = 3;
+  let lastBannerSweep = 0;
+
+  // 内容链接：视频 + 直播。
+  // 直播必须算进来，否则：
+  //   - scan() 抓不到直播卡片（定位入口是链接）；
+  //   - linkCount() 会把「只含直播链接的列表容器」当成单张卡片，
+  //     隐藏它就会清空整片信息流。
+  const FEED_LINK_SEL = 'a[href*="/video/BV"], a[href*="/video/av"], a[href*="live.bilibili.com/"]';
+
+  function linkCount(el) {
+    if (!el || !el.querySelectorAll) return 0;
+    return el.querySelectorAll(FEED_LINK_SEL).length;
+  }
+
+  // 是否直播卡片：链接指向 live.bilibili.com。
+  function isLiveCard(card) {
+    if (!card || !card.querySelector) return false;
+    try {
+      return !!card.querySelector('a[href*="live.bilibili.com/"]');
+    } catch (e) { return false; }
+  }
+
+  function hideCard(card, reason, hard) {
+    if (!card || card.dataset.blfHidden) return;
+    // 降级模式：判定出过错，只记录不隐藏，把控制权交回用户
+    // （只在短暂冷却窗口内生效，超时自动恢复 —— 见 recoverIfEmpty）
+    if (degradedActive()) {
+      stats.domHidden += 1;
+      log('降级模式，未隐藏:', reason);
+      return;
+    }
+
+    // 选卡片壳，但绝不选到列表容器
+    let shell = card;
+    const shellCand = card.closest(CARD_SEL);
+    if (shellCand && linkCount(shellCand) <= MAX_LINKS_PER_CARD) shell = shellCand;
+
+    if (linkCount(shell) > MAX_LINKS_PER_CARD) {
+      // 连卡片本身都太大了，退回到最小的可隐藏单元
+      shell = card;
+      if (linkCount(shell) > MAX_LINKS_PER_CARD) {
+        log('拒绝隐藏：目标含 ' + linkCount(shell) + ' 个视频，疑似列表容器');
+        return;
+      }
+    }
+
+    card.dataset.blfHidden = '1';
+    // 记录判定强度，供 recoverIfEmpty 精确恢复时使用：
+    // hard = 主题屏蔽 / 黑名单，是用户明确的"不要"，永不放回；
+    // 软判定 = 质量分，可能误杀，允许回退。
+    card.dataset.blfReason = String(reason || '');
+    if (hard) card.dataset.blfHard = '1';
+    shell.dataset.blfHidden = '1';
+    shell.dataset.blfReason = String(reason || '');
+    if (hard) shell.dataset.blfHard = '1';
+    shell.style.setProperty('display', 'none', 'important');
+    stats.domHidden += 1;
+    updateBadge();
+    log('DOM 隐藏:', reason);
+  }
+
+  function cardInfo(card) {
+    const authorLink = card.querySelector('a[href*="space.bilibili.com/"]');
+    const midMatch = authorLink && (authorLink.getAttribute('href') || '').match(/space\.bilibili\.com\/(\d+)/);
+
+    // 时长：不能只看 querySelector 的第一个匹配。
+    // DURATION_SEL 里有 [class*="duration"]，很宽 —— 第一个可能是个空元素
+    // 或包装容器；以前只要取到就 parse，解析失败就 null，
+    // 而 null → “时长未知” → 不删。短视颂就是这样漏网的。
+    // 现在遍历所有候选，取第一个能解析出有效秒数的。
+    let duration = null;
+    let durationRaw = '';
+    let durEls = card.querySelectorAll ? card.querySelectorAll(DURATION_SEL) : [];
+    // querySelectorAll 不可用（或返回空）时退回单数版本。
+    // 真实 DOM 里两者都在，但这一层兜底能防止某个封装/桩只实现了一个。
+    if (!durEls || !durEls.length) {
+      const one = card.querySelector ? card.querySelector(DURATION_SEL) : null;
+      durEls = one ? [one] : [];
+    }
+    for (let i = 0; i < durEls.length; i++) {
+      const txt = (durEls[i].textContent || '').replace(/\s+/g, ' ').trim();
+      if (!txt) continue;
+      const v = parseDuration(txt);
+      if (v != null) { duration = v; durationRaw = txt; break; }
+      if (!durationRaw) durationRaw = txt;   // 留作诊断：有时长但解不出
+    }
+    // class 全没命中：退回卡片文本里找时长形状。
+    // 只在前面的精确路径全部失败时才走，避免把标题里的 "2:30" 当时长。
+    if (duration == null) {
+      const tm = String(card.textContent || '').match(TEXT_DUR);
+      if (tm) {
+        const v = parseDuration(tm[0].trim());
+        if (v != null) { duration = v; durationRaw = tm[0].trim(); }
+      }
+    }
+
+    // UP 名与发布时间常常挤在同一个链接里："明玥谈棋· 10月18日"
+    const rawAuthor = authorLink ? authorLink.textContent.replace(/\s+/g, ' ').trim() : '';
+    const sepAt = rawAuthor.lastIndexOf('·');
+    const author = (sepAt > 0 ? rawAuthor.slice(0, sepAt) : rawAuthor).trim();
+    const timeText = sepAt > 0 ? rawAuthor.slice(sepAt + 1).trim() : '';
+
+    // 播放 / 弹幕：卡片底部两个数字项，第一个是播放量
+    let watch = null;
+    let danmaku = null;
+    const statEls = card.querySelectorAll('[class*="stats--item"], [class*="stats__item"]');
+    if (statEls.length) {
+      watch = parseCount(statEls[0].textContent);
+      if (statEls.length > 1) danmaku = parseCount(statEls[1].textContent);
+    }
+
+    // 标题：优先专用 class，再退回 h3，最后在 [title]/alt 里取最长的一条
+    let title = '';
+    const dedicated = card.querySelector(TITLE_SEL);
+    if (dedicated) title = (dedicated.getAttribute('title') || dedicated.textContent || '').trim();
+    if (!title) {
+      const cands = [];
+      card.querySelectorAll('[title]').forEach((el) => {
+        const v = (el.getAttribute('title') || '').trim();
+        if (v.length > 4) cands.push(v);
+      });
+      card.querySelectorAll('img[alt]').forEach((el) => {
+        const v = (el.getAttribute('alt') || '').trim();
+        if (v.length > 4) cands.push(v);
+      });
+      cands.sort((a, b) => b.length - a.length);
+      title = cands[0] || '';
+    }
+
+    return {
+      mid: midMatch ? midMatch[1] : null,
+      author,
+      isAd: cardIsAd(card),
+      isLive: isLiveCard(card),
+      published: timeText,
+      duration,
+      durationRaw,
+      watch,
+      danmaku,
+      title,
+    };
+  }
+
+  // 卡片右上角的「屏蔽此 UP」按钮，悬停出现
+  function addBlockButton(card, info) {
+    if (!info.mid || card.querySelector('.blf-block-btn')) return;
+    const btn = document.createElement('button');
+    btn.className = 'blf-block-btn';
+    btn.textContent = '⛔';
+    btn.title = '否决该 UP 主：' + (info.author || info.mid) + ' 此后其全部内容不再进入审核';
+    btn.style.cssText = [
+      'position:absolute', 'top:6px', 'right:6px', 'z-index:99',
+      'width:22px', 'height:22px', 'line-height:20px', 'padding:0',
+      'border:none', 'border-radius:50%', 'cursor:pointer',
+      'background:rgba(0,0,0,.55)', 'color:#fff', 'font-size:12px',
+      'opacity:0', 'transition:opacity .15s',
+    ].join(';');
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      store.add(info.mid, info.author);
+      document.querySelectorAll('a[href*="space.bilibili.com/' + info.mid + '"]')
+        .forEach((el) => hideCard(el.closest(CARD_SEL) || findCard(el), '黑名单', true));
+      hideCard(card, '黑名单', true);
+    });
+    if (getComputedStyle(card).position === 'static') card.style.position = 'relative';
+    card.appendChild(btn);
+    card.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
+    card.addEventListener('mouseleave', () => { btn.style.opacity = '0'; });
+  }
+
+  // DOM 层规则更保守：只处理高置信度的情况
+  // 返回判定详情，方便回传诊断（隐藏与否、分值、理由）
+  function judgeCard(info) {
+    const d = info.duration;
+    // 优先级必须与 scoreItem 一致：已关注 → 白名单 → 黑名单。
+    // 早先这里黑名单先于白名单，而接口层相反，导致
+    // 「♠ 点过 ✅ 的 UP」在 API 层放行、DOM 层却被隐藏。
+    if (isFollowed(info.mid)) {
+      return { hide: false, reason: '', fp: 0, sig: 0, hard: true, why: ['已关注'] };
+    }
+    if (allow.has(info.mid)) {
+      return { hide: false, reason: '', fp: 0, sig: 0, hard: true, why: ['白名单'] };
+    }
+    // 直播：白名单之后、广告与主题之前。
+    // 判据是链接指向 live.bilibili.com —— 不依赖接口的 goto 字段，
+    // 因为接口层 hook 从未触发过，只有 DOM 层是可靠的。
+    // 直播卡通常没有时长，若走时长门会落到「时长未知，跳过」而漏网，
+    // 所以必须在这里先判。
+    if (CONFIG.hideLive && info.isLive) {
+      return { hide: true, reason: '直播', fp: 0, sig: 0, hard: true, isLive: true };
+    }
+    // 广告：白名单之后、主题与时长之前。
+    // hard + neverKeep 由上层按 info.isAd 分别处理，这里只给结论。
+    if (CONFIG.hideAds && info.isAd) {
+      return { hide: true, reason: '广告位', fp: 0, sig: 0, hard: true, isAd: true };
+    }
+    if (info.mid && store.has(info.mid)) {
+      // hard: true —— 手动拉黑是用户明确的决定，空页自愈绝不能把它放回来。
+      return { hide: true, reason: '黑名单 UP', fp: 0, sig: 0, hard: true, topic: 'blacklist' };
+    }
+    // 与接口层完全共用 decide()，避免两层规则不一致。
+    // 不再提前因"时长未知"放行 —— 主题屏蔽不依赖时长。
+    const dec = decide(d == null ? 0 : d, info.title, info.author, info.mid);
+    const fp = marketingFingerprint(info.title);
+    const at = analyzeTitle(info.title);
+    return {
+      hide: dec.hide,
+      reason: dec.hide ? dec.why.join(' ') : '',
+      fp: fp.fp, fpWhy: fp.why, sig: at.signals,
+      topic: dec.topic || null,
+      // 主题命中 / 时长不足 = 硬判定。质量分（含 markdown 大字报）= 软判定，可回退。
+      hard: !!dec.topic || !!dec.shortVideo,
+    };
+  }
+
+  // 不依赖具体 class 名：从视频链接向上找到含时长的容器，那就是卡片
+  // 必须同时含「时长」和「标题」才算一张完整卡片。
+  // 只找时长会命中封面链接本身，而标题是它的兄弟节点 → 标题恒为空。
+  // 卡片文本里是否出现了时长形状的字符串（如 "2:59"）。
+  // 用在 findCard 的兜底上：B 站改版后 class 名一变，
+  // `[class*="duration"]` 就抓不到，卡片会因此被当成“没有时长”
+  // 而整张跳过 —— 既不隐藏也不进面板，静默漏网。
+  const TEXT_DUR = /(?:^|\s)(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s|$)/;
+
+  function findCard(link) {
+    let el = link;
+    let fallback = null;
+    for (let i = 0; i < 10 && el && el !== document.body; i++) {
+      if (el.querySelector) {
+        // 含多个视频链接的必然是列表容器，不是单张卡片
+        if (linkCount(el) > MAX_LINKS_PER_CARD) break;
+        const hasDurEl = !!el.querySelector(DURATION_SEL);
+        const hasTitle = !!el.querySelector(TITLE_SEL);
+        // 直播卡片**没有时长**，因此不能用「有时长」作为定位条件 ——
+        // 否则整张直播卡会被判定为「不是卡片」而跳过。
+        const isLive = !!el.querySelector('a[href*="live.bilibili.com/"]');
+        // class 抓不到时，退一步看文本里有没有时长形状
+        const hasDur = hasDurEl || isLive || (hasTitle && TEXT_DUR.test(el.textContent || ''));
+        if (hasDur && hasTitle) return el;
+        if (hasDur && !fallback) fallback = el;
+      }
+      el = el.parentElement;
+    }
+    return fallback;
+  }
+
+  /* --------------------------- 空页自愈 ---------------------------
+     最坏情况是把整页清空 —— 那比不过滤还糟。但"全清空"有两个完全不同的
+     成因，必须区别对待：
+
+     A. 判定故障：选择器错位、规则 bug，把正常内容也当成垃圾。
+        → 撤销隐藏 + 短暂降级（60 秒后自动恢复）。
+     B. 用户就是要全拦：一屏全是游戏 / 成功学 / 情感号（推荐流有聚集性）。
+        → 保持清空，只从软判定里放回 1 条，避免页面全白。
+
+     关键区别：旧版本一律走 A，于是"拦干净了"被当成"脚本坏了"，
+     全量恢复 + degraded = true 永久关闭过滤。用户换一换之后又回到满屏垃圾，
+     而且这一整页都不再过滤 —— 这是"明明装了脚本却还满屏垃圾"的主因。
+
+     判据：被隐藏的卡片里有没有硬判定（主题命中 / 黑名单）。
+     有硬判定 = 用户明确的"不要"，那是预期结果，不是故障。
+     状态变量声明在文件顶部（updateBadge 也要读）。   */
+
+  function visibleCardCount() {
+    let n = 0;
+    document.querySelectorAll(CARD_SEL).forEach((el) => {
+      if (el.dataset.blfHidden) return;
+      if (el.offsetParent === null) return;   // 被隐藏或脱离文档
+      n++;
+    });
+    return n;
+  }
+
+  function unhide(el) {
+    el.style.removeProperty('display');
+    delete el.dataset.blfHidden;
+    delete el.dataset.blfReason;
+    delete el.dataset.blfHard;
+  }
+
+  function recoverIfEmpty() {
+    if (degradedActive()) return false;
+    if (document.querySelectorAll(CARD_SEL).length === 0) return false;
+    if (visibleCardCount() > 0) return false;
+
+    const hidden = Array.from(document.querySelectorAll('[data-blf-hidden]'));
+    if (!hidden.length) return false;
+
+    const hard = hidden.filter((el) => el.dataset.blfHard === '1');
+    const soft = hidden.filter((el) => el.dataset.blfHard !== '1');
+
+    // ---- B. 有硬判定：这是用户明确不要的内容，保持清空 ----
+    if (hard.length) {
+      // 但仍从软判定里放回 1 条（软判定可能误杀），避免页面完全空白。
+      // 必须打标记：否则下一轮 scan 会把它重新判为 hide，
+      // 形成每 2 秒隐藏/放回一次的闪烁。
+      if (soft.length) {
+        unhide(soft[0]);
+        soft[0].dataset.blfKeepOnPurpose = '1';
+        console.warn(TAG, '本屏已全部过滤，放回 1 条软判定内容避免空白');
+      }
+      if (badgeEl) {
+        badgeEl.textContent = '🛡 ' + CALLSIGN + ' · 本屏全数否决（' + hard.length + ' 条红线/否决）';
+        badgeEl.style.background = 'rgba(40,90,60,.85)';
+      }
+      return false;
+    }
+
+    // ---- A. 全是软判定 ---
+    //   少量：正常（这屏就是质量差），放回 1 条即可。
+    //   大量（≥8）：疑似规则 bug 批量误杀，恢复 + 短暂降级。
+    if (soft.length >= 8) {
+      soft.forEach(unhide);
+      degraded = true;
+      degradedUntil = Date.now() + DEGRADE_COOLDOWN_MS;
+      console.warn(TAG, '疑似判定异常（' + soft.length + ' 条全部软判定），已恢复并在 '
+        + (DEGRADE_COOLDOWN_MS / 1000) + ' 秒内降级');
+      if (badgeEl) {
+        badgeEl.textContent = '🛡 ' + CALLSIGN + ' · 已撤回（判定异常，60s 后重试）';
+        badgeEl.style.background = 'rgba(150,40,40,.85)';
+      }
+      return true;
+    }
+
+    unhide(soft[0]);
+    soft[0].dataset.blfKeepOnPurpose = '1';
+    return false;
+  }
+
+  function scan(root, opts) {
+    const scope = root || document;
+    // 直播链接也在内：直播卡片的 href 指向 live.bilibili.com。
+    // 不纳入的话，「所有直播都删」这个需求在 DOM 层根本无从执行。
+    const links = scope.querySelectorAll(FEED_LINK_SEL);
+    stats.linkCount = links.length;
+    const cards = new Set();
+    links.forEach((a) => {
+      const c = findCard(a);
+      if (c) cards.add(c);
+    });
+    // 兼容：已知 class 也纳入。
+    // 但必须过滤掉列表容器 —— 容器能 querySelector 到子卡片的标题，
+    // 一旦被判为"要隐藏"，整片信息流就没了。这是真踩过的坑。
+    scope.querySelectorAll(CARD_SEL).forEach((c) => {
+      if (linkCount(c) <= MAX_LINKS_PER_CARD) cards.add(c);
+      else log('跳过容器（含 ' + linkCount(c) + ' 个视频）');
+    });
+
+    const detail = [];
+    const seenKeys = new Set();
+    cards.forEach((card) => {
+      // 已被空页自愈放回的卡片：不再重复隐藏，否则会每 2 秒闪烁一次。
+      if (card.dataset.blfKeepOnPurpose) {
+        const info = cardInfo(card);
+        if (!card.dataset.blfSeen) { card.dataset.blfSeen = '1'; stats.domSeen += 1; }
+        detail.push({
+          mid: info.mid, author: info.author, title: info.title,
+          dur: info.duration, durRaw: info.durationRaw, watch: info.watch, danmaku: info.danmaku,
+          published: info.published,
+          hidden: false, verdict: 'keep', reason: '（保底放回）',
+          fp: 0, sig: 0, fpWhy: [],
+        });
+        return;
+      }
+      const info = cardInfo(card);
+      const verdict = judgeCard(info);
+      if (!card.dataset.blfSeen) { card.dataset.blfSeen = '1'; stats.domSeen += 1; }
+      if (info.mid) addBlockButton(card, info);
+      if (verdict.hide && !card.dataset.blfHidden) {
+        // 主题命中 / 黑名单是硬判定：永不自愈恢复。只有质量分才可能被回退。
+        hideCard(card, verdict.reason, !!verdict.hard);
+        recordHidden(info, verdict);
+      }
+
+      // 一张卡可能被多个 BV 链接匹配到不同祖先，按 mid+标题去重
+      const key = (info.mid || '') + '|' + (info.title || '');
+      if (seenKeys.has(key)) return;
+      seenKeys.add(key);
+
+      // UP 主维度累计：营销号 2 条即拉黑，指定话题 3 条即拉黑。
+      // 用户抱怨的是"换一换又冒出来"——屏蔽账号才能根治，屏蔽单条只是打地鼠。
+      if (verdict.hide && verdict.topic) {
+        bumpQuality(info.mid, info.author, key, 'topic');
+      } else {
+        const fpWhy = verdict.fpWhy || [];
+        if (verdict.hide && fpWhy.some((w) => HARD_MARK.test(w))) {
+          bumpQuality(info.mid, info.author, key, 'quality');
+        }
+      }
+
+      if (info.title || info.duration != null) {
+        detail.push({
+          mid: info.mid, author: info.author, title: info.title,
+          dur: info.duration, durRaw: info.durationRaw, watch: info.watch, danmaku: info.danmaku,
+          published: info.published,
+          hidden: !!card.dataset.blfHidden,
+          verdict: verdict.hide ? 'hide' : 'keep',
+          // 放行时 reason 原本恒为空，面板/诊断都看不出是“已关注”还是“白名单”。
+          // 主题拦截被这两个优先级挡下时最难查，必须把原由带出来。
+          reason: verdict.reason || (verdict.why || []).join(' '), fp: verdict.fp, sig: verdict.sig,
+          fpWhy: verdict.fpWhy || [],
+        });
+      }
+    });
+    // 只在没有显式指定 root 的全量扫描后做检查，避免 MutationObserver
+    // 处理片段时误判（那时页面本来就没几张卡片）
+    // 只在全量扫描（整页）后做空页检查。
+    // 注意：不能写成 !root —— bootDom 和定时器都传 scan(document)，
+    // 那样 recoverIfEmpty 永远不会被调用（曾经就是这么坏的死代码）。
+    // 广告位与卡片分开清：banner 不是视频卡片，CARD_SEL 抓不到。
+    // 放在 scan 里而不是只在 bootDom：B 站是 SPA，切页后 banner 会重新出现。
+    // 节流 500ms —— MutationObserver 触发很频繁，没必要每次都查。
+    const now = Date.now();
+    if (now - lastBannerSweep > 500) {
+      lastBannerSweep = now;
+      try { cleanAdBanners(); } catch (e) { /* banner 清理失败不影响卡片判定 */ }
+    }
+
+    const isFullScan = !root || root === document || root === document.body;
+    if (isFullScan) recoverIfEmpty();
+    updateBadge();
+    return detail;
+  }
+
+  function bootDom() {
+    scan(document);
+    if (CONFIG.showBadge) {
+      const b = document.createElement('div');
+      b.id = 'blf-alive';
+      b.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(b);
+      window.__BLF_ACTIVE__ = true;
+      updateBadge();
+    }
+    // 兜底：B 站是 SPA，渲染时机不确定，定期重扫
+    setInterval(() => {
+      try {
+        scan(document, { silent: true });
+      } catch (e) {
+        if (badgeEl) badgeEl.textContent = 'ERR: ' + (e && e.message ? e.message : e);
+      }
+    }, 2000);
+
+    const mo = new MutationObserver((muts) => {
+      for (const m of muts) {
+        m.addedNodes.forEach((n) => {
+          if (n.nodeType !== 1) return;
+          if (n.querySelector && n.querySelector('a[href*="/video/BV"], a[href*="/video/av"]')) scan(n);
+        });
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootDom, { once: true });
+  } else {
+    bootDom();
+  }
+
+  /* --------------------------- 调试用控制台 API --------------------------- */
+  window.__BLF = {
+    config: CONFIG,
+    // 规则表本体。topic-test.js 靠它校对 CONFIG.topics 的键是否漏写 ——
+    // 开关漏写时整类静默失效、不报错，只能靠断言守。
+    topics: TOPICS,
+    blacklist: () => store.all(),
+    whitelist: () => allow.all(),
+    unblock: (mid) => store.remove(mid),
+    allow: (mid, name) => allow.add(mid, name),
+    panel: () => showPanel(),
+    scan: () => scan(document),
+    test: (items) => items.map((it) => ({ title: it.title, dur: it.duration, ...scoreItem(it) })),
+    filter: (items) => filterItems(items),
+    // 排查“明明该拦却没拦”：按关键词找当前页面上的卡片，
+    // 输出标题、UP、判定和放行理由（已关注 / 白名单 / 时长未知…）。
+    // 例：__BLF.explain('奥莉安')
+    explain: (kw) => {
+      const needle = String(kw || '').toLowerCase();
+      const rows = (scan(document) || []).filter(
+        (r) => !needle || String(r.title || '').toLowerCase().includes(needle)
+      );
+      rows.forEach((r) => {
+        // 用户主动调用，不受 CONFIG.debug 影响。
+        // durRaw 一定要打出来："时长未知"到底是卡片上没有时长，
+        // 还是我们解析失败，看这一项就能分辨。
+        console.log(TAG, r.verdict === 'hide' ? '拦' : '留',
+          '[' + (r.reason || '-') + ']',
+          r.author, '|', (r.dur == null ? '时长?' : r.dur + 's')
+          + (r.durRaw ? '(原文:' + r.durRaw + ')' : '') + ' |', r.title);
+      });
+      if (!rows.length) console.log(TAG, '页面上没找到匹配「' + kw + '」的卡片');
+      return rows;
+    },
+  };
+})();

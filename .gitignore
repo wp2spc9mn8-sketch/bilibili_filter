@@ -1,3 +1,44 @@
+# macOS 元数据
 .DS_Store
-node_modules/
+
+# ---- 本地工具状态 ----
+# AI 跑批的中间状态，与脚本本身无关
+.codewhale/
+codewhale/
+.trae/
+.cursor/
+.deepseek/
+
+# ---- Tampermonkey 的 LevelDB 备份 ----
+# deploy.sh 说明里提到 backup/tm-settings-221415 是回滚基线，
+# 但那是本机 Chrome 的二进制库（每个约 1MB，共 6.8MB），
+# 换台机器就没有意义，不进版本库。
+backup/tm-settings-*/
+
+# Chrome 的 Local State（浏览器状态快照，含 autofill 等本机配置）
+# ⚠ 隐私数据，绝不能进公开仓库。注意这里**不带尾斜杠** ——
+# 写成 backup/local-state-*/ 只匹配目录，而实际是个文件，会漏掉。
+backup/local-state-*
+
+# 3.2.0 的脚本快照保留（releases/ 里最早只到 4.2.0，这个是更早的基线）
+!backup/*.user.js
+
+# ---- 无关素材 ----
+# 21 张封面图，13MB，README 与代码都没引用
+covers/
+
+# 空壳目录，只有工具状态
+quark/
+
+# ---- 临时产物 ----
 *.log
+*.tmp
+*.swp
+
+# ---- releases - 只收 dist 包 ----
+# 个人版 .user.js 快照里带着 @updateURL http://127.0.0.1:8899，
+# 别人装上去会让 Tampermonkey 反复连他自己本机的 8899 端口：
+# 更新永远失败，万一那头有别的服务还可能拉到不明内容。
+# 可分发的一律是 -dist 后缀，它由 make-dist.sh 删掉那两行后生成。
+releases/*.user.js
+!releases/*-dist.user.js

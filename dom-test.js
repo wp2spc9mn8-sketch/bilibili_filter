@@ -124,7 +124,10 @@ check('findCard 会因链接过多提前终止', /if \(linkCount\(el\) > MAX_LIN
 check('scan 会跳过容器', /if \(linkCount\(c\) <= MAX_LINKS_PER_CARD\) cards\.add\(c\)/.test(src));
 check('hideCard 拒绝隐藏容器', /拒绝隐藏：目标含/.test(src));
 check('存在空页自愈机制', /function recoverIfEmpty/.test(src));
-check('降级模式下不再隐藏', /if \(degraded\) \{[\s\S]{0,80}return;/.test(src));
+// 降级现在是带冷却的，不再是永久布尔。行为细节由 degrade-test.js 验证。
+check('降级走带冷却的判断函数', /function degradedActive\(\)/.test(src));
+check('降级时序检查在隐藏前', /if \(degradedActive\(\)\) \{[\s\S]{0,80}return;/.test(src));
+check('空页自愈在全量扫描后被调用', /isFullScan.*recoverIfEmpty|root === document[\s\S]{0,60}recoverIfEmpty/.test(src));
 
 console.log('\n--- 阈值合理性 ---');
 const m = src.match(/MAX_LINKS_PER_CARD\s*=\s*(\d+)/);

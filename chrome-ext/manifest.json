@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "B站低质内容过滤",
+  "version": "3.1.0",
+  "description": "过滤 B 站首页推荐流里的大字报 / 营销号视频：时长 + 文案指纹 + UP 主黑名单",
+  "content_scripts": [
+    {
+      "matches": ["https://www.bilibili.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    }
+  ],
+  "host_permissions": ["https://www.bilibili.com/*"],
+  "minimum_chrome_version": "111"
+}

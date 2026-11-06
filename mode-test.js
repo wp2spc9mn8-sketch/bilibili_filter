@@ -54,14 +54,16 @@ const check = (name, cond) => { console.log((cond ? ' PASS ' : ' FAIL ') + name)
 console.log('');
 check('off 档：一条都不砍', rows.off.every((v) => v === false));
 check('aggressive：营销号短视频被砍', rows.aggressive[0] === true);
-// 短视频走更低门槛的指纹判定，而不是按长度一刀切 ——
-// 正常短视频（游戏片段、绘画、美食）同样很短，砍长度会大面积误杀
-check('aggressive：正常短视频保留', rows.aggressive[1] === false);
-check('aggressive：长视频保留', rows.aggressive[4] === false && rows.aggressive[5] === false);
-check('aggressive：央视军事 45s 短新闻走白名单保留', rows.aggressive[3] === false);
-check('balanced：标题正常的短视频被放过', rows.balanced[1] === false);
-check('light：只砍标题明确的', rows.light[0] === true && rows.light[1] === false);
-check('所有档位：长视频都不砍', modes.every((m) => rows[m][4] === false && rows[m][5] === false));
+// 4.24.0 起策略反转：不再按标题质量判断短视频，而是不足 minKeepDuration 一律砍。
+// 原因：用户明确要求「视频时间不足三分钟的都删掉」——这是长度偏好，不是质量判断。
+check('aggressive：短视频一律砍（不足 3 分钟）',
+  rows.aggressive[0] === true && rows.aggressive[1] === true && rows.aggressive[2] === true);
+// 时长偏好排在权威媒体豁免之前：央视 45s 也砍
+check('aggressive：央视军事 45s 也砍（时长优先于权威豁免）', rows.aggressive[3] === true);
+check('balanced：短视频同样砍', rows.balanced[1] === true && rows.balanced[3] === true);
+check('light：短视频同样砍', rows.light[1] === true && rows.light[3] === true);
+check('所有非 off 档位：≥ 3 分钟的长视频都不砍',
+  ['light', 'balanced', 'aggressive'].every((m) => rows[m][4] === false && rows[m][5] === false));
 
 // 已关注豁免
 const BLF = load('aggressive');
