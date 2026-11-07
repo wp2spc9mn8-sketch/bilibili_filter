@@ -25,3 +25,4 @@ b92d0a106762905005b937eb610df2f13e31b82b332c81d7f2ba2da5a0153d7f  releases/bilib
 68faadcb282d4fd82a83d30c278ec009814f2a782a2f074f0f44bcf9c08c2209  releases/bilibili-filter-v4.45.0-dist.user.js
 2e88b38e10388a1dcb7f994ab1e73d788c2725fd8d78ca45ae23e95d7e369e9b  releases/bilibili-filter-v4.46.0-dist.user.js
 e91e11b4b9cb3ff75bc7e04a809de48ddd93c2f8559efbcda64b4dfcdb5d4c82  releases/bilibili-filter-v4.47.0-dist.user.js
+535c6f5b37ce88e38f7a188064609bb68864ffa10ebe8473ed2aa7f20823db1d  releases/bilibili-filter-v4.48.0-dist.user.js
