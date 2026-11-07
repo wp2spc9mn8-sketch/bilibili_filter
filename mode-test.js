@@ -29,7 +29,7 @@ const samples = [
   { duration: 95,  title: '赛博朋克：边缘行者',       owner: { mid: 3 }, stat: { view: 8e4, like: 7000 },  tag: '正常动画剪辑' },
   { duration: 45,  title: '首型！首次！四川舰，弹了！', owner: { mid: 4, name: '央视军事' }, stat: { view: 3e5, like: 25000 }, tag: '央视军事短新闻' },
   { duration: 600, title: '【4K】挪威自驾 Day3',     owner: { mid: 5 }, stat: { view: 5e4, like: 4000 },  tag: '正常长视频' },
-  { duration: 1800,title: '纯音乐｜雨声助眠 30 分钟',  owner: { mid: 6 }, stat: { view: 9e4, like: 8000 },  tag: '正常长音频' },
+  { duration: 1800,title: '【纯音乐】久石让 天空之城 钢琴版', owner: { mid: 6 }, stat: { view: 9e4, like: 8000 },  tag: '正常长音频' },
 ];
 
 const modes = ['off', 'light', 'balanced', 'aggressive'];
